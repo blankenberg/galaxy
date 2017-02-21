@@ -7,7 +7,7 @@ import sys
 import shutil
 import os
 
-from galaxy.datatypes.images import Html
+from galaxy.datatypes.text import Html
 from galaxy.util import FILENAME_VALID_CHARS
 
 log = logging.getLogger(__name__)
@@ -64,6 +64,8 @@ class AnvioComposite( Html ):
         """Documented as an old display method, but still gets called via tests etc
         This allows us to format the data shown in the central pane via the "eye" icon.
         """
+        print 'display_data', preview, type(preview)
+        print 'kwd', kwd
         if not preview:
             trans.response.set_content_type(data.get_mime())
             trans.log_event("Display dataset id: %s" % str(data.id))
@@ -86,6 +88,8 @@ class AnvioComposite( Html ):
             trans.response.headers["Content-Disposition"] = 'attachment; filename="Galaxy%s-[%s].%s"' % \
                                                             (data.hid, download_zip, "zip")
             return open(download_zip)
+        return super( AnvioComposite, self ).display_data( trans, data, preview=preview, filename=filename,
+            to_ext=to_ext, size=size, offset=offset, **kwd)
 
 #class AnvioDB( AnvioComposite ):
 #    """
