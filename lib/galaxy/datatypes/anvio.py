@@ -50,7 +50,7 @@ class AnvioComposite( Html ):
             for rel_path in extra_files:
                 rval.append('<li><a href="%s">%s</a></li>' % (rel_path, rel_path))
             rval.append('</ul>')
-        if note ( defined_files or extra_files ):
+        if not ( defined_files or extra_files ):
             rval.append( "<p/>This composite dataset does not contain any files!<p/><ul>" )
         rval.append('</html>')
         return "\n".join(rval)
