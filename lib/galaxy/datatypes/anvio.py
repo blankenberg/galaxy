@@ -22,20 +22,30 @@ class AnvioComposite( Html ):
     file_ext = "anvio_composite"
     composite_type = 'auto_primary_file'
 
-    def generate_primary_file( self, dataset=None) :
+    def generate_primary_file( self, dataset=None):
         """
         This is called only at upload to write the html file
         cannot rename the datasets here - they come with the default unfortunately
         """
+        defined_files = self.get_composite_files(dataset=dataset).iteritems()
         rval = [
             "<html><head><title>Files for Anvi'o Composite Dataset (%s)</title></head><p/>\
             This composite dataset is composed of the following files:<p/><ul>" % (
                 self.file_ext)]
-        for composite_name, composite_file in self.get_composite_files(dataset=dataset).iteritems():
+        for composite_name, composite_file in defined_files:
             opt_text = ''
             if composite_file.optional:
                 opt_text = ' (optional)'
-            rval.append('<li><a href="%s">%s</a>%s' % (composite_name, composite_name, opt_text))
+            rval.append('<li><a href="%s">%s</a>%s</li>' % (composite_name, composite_name, opt_text))
+        rval.append('<li><Additional Items</li>')
+        log.debug( 'walking: %s', dataset.extra_files_path)
+        for (dirpath, dirnames, filenames) in os.walk(dataset.extra_files_path, followlinks=True):
+            log.debug( 'dirpath: %s' ) % dirpath
+            log.debug( 'dirnames: %s' ) % dirnames
+            log.debug( 'filenames: %s' ) % filenames
+            rel_path = os.path.relpath(dirpath, dataset.extra_files_path)
+            for filename in filenames:
+                rval.append('<li><a href="%s">%s</a></li>' % (rel_path, rel_path))
         rval.append('</ul></html>')
         return "\n".join(rval)
 
