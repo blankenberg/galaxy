@@ -43,8 +43,8 @@ class AnvioComposite( Html ):
             log.debug( 'dirpath: %s' ) % dirpath
             log.debug( 'dirnames: %s' ) % dirnames
             log.debug( 'filenames: %s' ) % filenames
-            rel_path = os.path.relpath(dirpath, dataset.extra_files_path)
             for filename in filenames:
+                rel_path = os.path.relpath( os.path.join( dirpath, filename ), dataset.extra_files_path)
                 rval.append('<li><a href="%s">%s</a></li>' % (rel_path, rel_path))
         rval.append('</ul></html>')
         return "\n".join(rval)
