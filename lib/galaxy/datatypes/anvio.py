@@ -40,9 +40,9 @@ class AnvioComposite( Html ):
         rval.append('<li><Additional Items</li>')
         log.debug( 'walking: %s', dataset.extra_files_path)
         for (dirpath, dirnames, filenames) in os.walk(dataset.extra_files_path, followlinks=True):
-            log.debug( 'dirpath: %s' ) % dirpath
-            log.debug( 'dirnames: %s' ) % dirnames
-            log.debug( 'filenames: %s' ) % filenames
+            log.debug( 'dirpath: %s', dirpath )
+            log.debug( 'dirnames: %s', dirnames )
+            log.debug( 'filenames: %s', filenames )
             for filename in filenames:
                 rel_path = os.path.relpath( os.path.join( dirpath, filename ), dataset.extra_files_path)
                 rval.append('<li><a href="%s">%s</a></li>' % (rel_path, rel_path))
