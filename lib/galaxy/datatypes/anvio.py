@@ -37,7 +37,8 @@ class AnvioComposite( Html ):
             if composite_file.optional:
                 opt_text = ' (optional)'
             rval.append('<li><a href="%s">%s</a>%s</li>' % (composite_name, composite_name, opt_text))
-        rval.append('<li><Additional Items</li>')
+            defined_files.append( composite_name )
+        extra_files = []
         log.debug( 'walking: %s', dataset.extra_files_path)
         for (dirpath, dirnames, filenames) in os.walk(dataset.extra_files_path, followlinks=True):
             log.debug( 'dirpath: %s', dirpath )
@@ -45,6 +46,11 @@ class AnvioComposite( Html ):
             log.debug( 'filenames: %s', filenames )
             for filename in filenames:
                 rel_path = os.path.relpath( os.path.join( dirpath, filename ), dataset.extra_files_path)
+                if rel_path not in defined_files:
+                    extra_files.append( rel_path )
+        if extra_files:
+            rval.append('<li>Additional Items</li>')
+            for filename in extra_files:
                 rval.append('<li><a href="%s">%s</a></li>' % (rel_path, rel_path))
         rval.append('</ul></html>')
         return "\n".join(rval)
