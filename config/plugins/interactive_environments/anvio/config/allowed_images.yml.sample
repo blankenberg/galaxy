@@ -1,0 +1,5 @@
+---
+-
+    image: galaxy/anvio:5.3
+    description: |
+        An analysis and visualization platform for omics data

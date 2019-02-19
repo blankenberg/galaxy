@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE interactive_environment SYSTEM "../../interactive_environments.dtd">
+<interactive_environment name="anvio">
+    <data_sources>
+        <data_source>
+            <model_class>HistoryDatasetAssociation</model_class>
+            <test type="isinstance" test_attr="datatype" result_type="datatype">anvio.anvio_profile_db</test>
+            <to_param param_attr="id">dataset_id</to_param>
+        </data_source>
+        <data_source>
+            <model_class>HistoryDatasetAssociation</model_class>
+            <test type="isinstance" test_attr="datatype" result_type="datatype">anvio.anvio_contig_db</test>
+            <to_param param_attr="id">additional_dataset_ids</to_param>
+        </data_source>
+    </data_sources>
+    <params>
+        <param type="dataset" var_name_in_template="profile_db" required="true">dataset_id</param>
+        <param type="dataset" var_name_in_template="contig_db" required="true">additional_dataset_ids</param>
+    </params>
+    <entry_point entry_point_type="mako">anvio.mako</entry_point>
+</interactive_environment>
