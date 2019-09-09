@@ -144,7 +144,7 @@ class InteractiveToolManager(object):
     def create_entry_points(self, job, tool, entry_points=None, flush=True):
         entry_points = entry_points or tool.ports
         for entry in entry_points:
-            ep = self.model.InteractiveToolEntryPoint(job=job, tool_port=entry['port'], entry_url=entry['url'], name=entry['name'])
+            ep = self.model.InteractiveToolEntryPoint(job=job, tool_port=entry['port'], entry_url=entry['url'], name=entry['name'], requires_domain=entry['requires_domain'])
             self.sa_session.add(ep)
         if flush:
             self.sa_session.flush()
@@ -260,8 +260,17 @@ class InteractiveToolManager(object):
     def target_if_active(self, trans, entry_point):
         if entry_point.active and not entry_point.deleted:
             request_host = trans.request.host
-            rval = '%s//%s-%s.%s.%s.%s/' % (trans.request.host_url.split('//', 1)[0], trans.security.encode_id(entry_point.id),
-                    entry_point.token, entry_point.__class__.__name__.lower(), self.app.config.interactivetool_prefix, request_host)
+            if entry_point.requires_domain:
+                rval = '%s//%s-%s.%s.%s.%s/' % (trans.request.host_url.split('//', 1)[0],
+                    trans.security.encode_id(entry_point.id),
+                    entry_point.token,
+                    entry_point.__class__.__name__.lower(),
+                    self.app.config.interactivetool_prefix, request_host)
+            else:
+                rval = self.app.url_for('%s/access/%s/%s/%s/' % (trans.app.config.interactivetool_prefix,
+                    entry_point.__class__.__name__.lower(),
+                    trans.security.encode_id(entry_point.id),
+                    entry_point.token))
             if entry_point.entry_url:
                 rval = '%s/%s' % (rval.rstrip('/'), entry_point.entry_url.lstrip('/'))
             return rval
