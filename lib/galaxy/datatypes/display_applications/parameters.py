@@ -47,7 +47,7 @@ class DisplayApplicationParameter(object):
         return False
 
     def build_url(self, other_values):
-        return fill_template(self.url, context=other_values)
+        return fill_template(self.url, context=other_values).replace('/', '-')
 
 
 class DisplayApplicationDataParameter(DisplayApplicationParameter):
