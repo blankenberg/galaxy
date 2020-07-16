@@ -269,7 +269,7 @@ class InteractiveToolManager(object):
                 rval = '%s//%s-%s.%s.%s.%s/' % (protocol, entry_point_encoded_id,
                         entry_point.token, entry_point_class, entry_point_prefix, interactivetools_proxy_host)
             else:
-                rval = self.app.url_for('%s/access/%s/%s/%s/' % (entry_point_prefix,
+                rval = self.app.url_for('/%s/access/%s/%s/%s/' % (entry_point_prefix,
                     entry_point_class,
                     entry_point_encoded_id,
                     entry_point.token))
