@@ -11,22 +11,30 @@ import pwd
 import shlex
 import shutil
 import string
-import subprocess
 import sys
 import time
 import traceback
-from abc import ABCMeta, abstractmethod
+from abc import (
+    ABCMeta,
+    abstractmethod,
+)
 from json import loads
-from xml.etree import ElementTree
 
+import packaging.version
 import six
 import yaml
 from pulsar.client.staging import COMMAND_VERSION_FILENAME
 
 import galaxy
-from galaxy import model, util
+from galaxy import (
+    model,
+    util,
+)
 from galaxy.datatypes import sniff
-from galaxy.exceptions import ObjectInvalid, ObjectNotFound
+from galaxy.exceptions import (
+    ObjectInvalid,
+    ObjectNotFound,
+)
 from galaxy.job_execution.datasets import (
     DatasetPath,
     NullDatasetPathRewriter,
@@ -34,14 +42,28 @@ from galaxy.job_execution.datasets import (
     TaskPathRewriter
 )
 from galaxy.job_execution.output_collect import collect_extra_files
+from galaxy.job_execution.setup import ensure_configs_directory
 from galaxy.jobs.actions.post import ActionBox
-from galaxy.jobs.mapper import JobMappingException, JobRunnerMapper
+from galaxy.jobs.mapper import (
+    JobMappingException,
+    JobRunnerMapper,
+)
 from galaxy.jobs.runners import BaseJobRunner, JobState
 from galaxy.metadata import get_metadata_compute_strategy
+from galaxy.model import store
 from galaxy.objectstore import ObjectStorePopulator
 from galaxy.tool_util.deps import requirements
-from galaxy.tool_util.output_checker import check_output, DETECTED_JOB_STATE
-from galaxy.util import safe_makedirs, unicodify
+from galaxy.tool_util.output_checker import (
+    check_output,
+    DETECTED_JOB_STATE,
+)
+from galaxy.util import (
+    commands,
+    parse_xml_string,
+    RWXRWXRWX,
+    safe_makedirs,
+    unicodify,
+)
 from galaxy.util.bunch import Bunch
 from galaxy.util.expressions import ExpressionContext
 from galaxy.util.xml_macros import load
@@ -168,6 +190,10 @@ def job_config_xml_to_dict(config, root):
         environment["metrics"] = metrics_to_dict
 
         params = JobConfiguration.get_params(config, destination)
+        # Handle legacy XML enabling sudo when using docker by default.
+        if "docker_sudo" not in params:
+            params["docker_sudo"] = "true"
+
         # TODO: handle enabled/disabled in configure_from
         environment['params'] = params
         environment['env'] = JobConfiguration.get_envs(destination)
@@ -375,18 +401,23 @@ class JobConfiguration(ConfiguresHandlers):
         environments = execution_dict.get("environments", [])
         enviroment_iter = map(lambda e: (e["id"], e), environments) if isinstance(environments, list) else environments.items()
         for environment_id, environment_dict in enviroment_iter:
-            metrics = environment_dict.get("metrics") or {"src": "default"}
-            metrics_src = metrics.get("src") or "default"
-            if metrics_src != "default":
-                # customized metrics for this environment.
-                if metrics_src == "disabled":
-                    job_metrics.set_destination_instrumenter(environment_id, None)
-                elif metrics_src == "xml_element":
-                    metrics_element = metrics.get("xml_element")
-                    job_metrics.set_destination_conf_element(environment_id, metrics_element)
-                elif metrics_src == "path":
-                    metrics_conf_path = self.app.config.resolve_path(metrics.get("path"))
-                    job_metrics.set_destination_conf_file(environment_id, metrics_conf_path)
+            metrics = environment_dict.get("metrics")
+            if metrics is None:
+                metrics = {"src": "default"}
+            if isinstance(metrics, list):
+                job_metrics.set_destination_conf_dicts(environment_id, metrics)
+            else:
+                metrics_src = metrics.get("src") or "default"
+                if metrics_src != "default":
+                    # customized metrics for this environment.
+                    if metrics_src == "disabled":
+                        job_metrics.set_destination_instrumenter(environment_id, None)
+                    elif metrics_src == "xml_element":
+                        metrics_element = metrics.get("xml_element")
+                        job_metrics.set_destination_conf_element(environment_id, metrics_element)
+                    elif metrics_src == "path":
+                        metrics_conf_path = self.app.config.resolve_path(metrics.get("path"))
+                        job_metrics.set_destination_conf_file(environment_id, metrics_conf_path)
 
             destination_kwds = {}
 
@@ -491,7 +522,7 @@ class JobConfiguration(ConfiguresHandlers):
         """Loads the new-style job configuration from options in the job config file (by default, job_conf.xml).
 
         :param tree: Object representing the root ``<job_conf>`` object in the job config file.
-        :type tree: ``xml.etree.ElementTree.Element``
+        :type tree: ``lxml.etree._Element``
         """
         root = tree.getroot()
         log.debug('Loading job configuration from %s' % self.app.config.job_config_file)
@@ -542,7 +573,7 @@ class JobConfiguration(ConfiguresHandlers):
                 fields_names = self.resource_groups[resource_group]
                 fields = [self.resource_parameters[n] for n in fields_names]
                 if fields:
-                    conditional_element = ElementTree.fromstring(self.JOB_RESOURCE_CONDITIONAL_XML)
+                    conditional_element = parse_xml_string(self.JOB_RESOURCE_CONDITIONAL_XML)
                     when_yes_elem = conditional_element.findall('when')[1]
                     for parameter in fields:
                         when_yes_elem.append(parameter)
@@ -576,7 +607,7 @@ class JobConfiguration(ConfiguresHandlers):
         """Parses any child <param> tags in to a dictionary suitable for persistence.
 
         :param parent: Parent element in which to find child <param> tags.
-        :type parent: ``xml.etree.ElementTree.Element``
+        :type parent: ``lxml.etree._Element``
 
         :returns: dict
         """
@@ -587,7 +618,7 @@ class JobConfiguration(ConfiguresHandlers):
         """Parses any child <env> tags in to a dictionary suitable for persistence.
 
         :param parent: Parent element in which to find child <env> tags.
-        :type parent: ``xml.etree.ElementTree.Element``
+        :type parent: ``lxml.etree._Element``
 
         :returns: dict
         """
@@ -607,7 +638,7 @@ class JobConfiguration(ConfiguresHandlers):
         """Parses any child <resubmit> tags in to a dictionary suitable for persistence.
 
         :param parent: Parent element in which to find child <resubmit> tags.
-        :type parent: ``xml.etree.ElementTree.Element``
+        :type parent: ``lxml.etree._Element``
 
         :returns: dict
         """
@@ -716,7 +747,7 @@ class JobConfiguration(ConfiguresHandlers):
         rval = {}
         if handler_id in self.handler_runner_plugins:
             plugins_to_load = [rp for rp in self.runner_plugins if rp['id'] in self.handler_runner_plugins[handler_id]]
-            log.info("Handler '%s' will load specified runner plugins: %s", handler_id, ', '.join([rp['id'] for rp in plugins_to_load]))
+            log.info("Handler '%s' will load specified runner plugins: %s", handler_id, ', '.join(rp['id'] for rp in plugins_to_load))
         else:
             plugins_to_load = self.runner_plugins
             log.info("Handler '%s' will load all configured runner plugins", handler_id)
@@ -875,14 +906,20 @@ class JobWrapper(HasResourceParameters):
         self.output_paths = None
         self.output_hdas_and_paths = None
         self.tool_provided_job_metadata = None
-        # Wrapper holding the info required to restore and clean up from files used for setting metadata externally
-        self.external_output_metadata = get_metadata_compute_strategy(self.app.config, job.id)
         self.job_runner_mapper = JobRunnerMapper(self, queue.dispatcher.url_to_destination, self.app.job_config)
         self.params = None
         if job.params:
             self.params = loads(job.params)
         if use_persisted_destination:
             self.job_runner_mapper.cached_job_destination = JobDestination(from_job=job)
+        # Wrapper holding the info required to restore and clean up from files used for setting metadata externally
+        try:
+            metadata_strategy_override = self.get_destination_configuration('metadata_strategy', None)
+        except JobMappingException:
+            metadata_strategy_override = None
+        if job.tasks:
+            metadata_strategy_override = "directory"
+        self.external_output_metadata = get_metadata_compute_strategy(self.app.config, job.id, metadata_strategy_override=metadata_strategy_override)
 
         self.__commands_in_new_shell = True
         self.__user_system_pwent = None
@@ -894,7 +931,8 @@ class JobWrapper(HasResourceParameters):
         if self._dataset_path_rewriter is None:
             outputs_to_working_directory = util.asbool(self.get_destination_configuration("outputs_to_working_directory", False))
             if outputs_to_working_directory:
-                self._dataset_path_rewriter = OutputsToWorkingDirectoryPathRewriter(self.working_directory)
+                output_directory = self.outputs_directory
+                self._dataset_path_rewriter = OutputsToWorkingDirectoryPathRewriter(self.working_directory, output_directory)
             else:
                 self._dataset_path_rewriter = NullDatasetPathRewriter()
         return self._dataset_path_rewriter
@@ -902,6 +940,17 @@ class JobWrapper(HasResourceParameters):
     @property
     def dataset_path_rewriter(self):
         return self._job_dataset_path_rewriter
+
+    @property
+    def outputs_directory(self):
+        """Default location of ``outputs_to_working_directory``.
+        """
+        return None if self.created_with_galaxy_version < packaging.version.parse("20.01") else "outputs"
+
+    @property
+    def created_with_galaxy_version(self):
+        galaxy_version = self.get_job().galaxy_version or "19.05"
+        return packaging.version.parse(galaxy_version)
 
     @property
     def dependency_shell_commands(self):
@@ -1008,11 +1057,11 @@ class JobWrapper(HasResourceParameters):
         return False
 
     def get_version_string_path(self):
-        return os.path.abspath(os.path.join(self.working_directory, COMMAND_VERSION_FILENAME))
+        return os.path.abspath(os.path.join(self.working_directory, "outputs", COMMAND_VERSION_FILENAME))
 
-    # TODO: Remove in Galaxy 20.XX, for running jobs at GX upgrade
+    # TODO: Remove in Galaxy 21.XX, for running jobs at GX upgrade
     def get_version_string_path_legacy(self):
-        return os.path.abspath(os.path.join(self.app.config.new_file_path, "GALAXY_VERSION_STRING_%s" % self.job_id))
+        return os.path.abspath(os.path.join(self.working_directory, COMMAND_VERSION_FILENAME))
 
     def __prepare_upload_paramfile(self, tool_evaluator):
         """Special case paramfile handling for the upload tool. Moves the paramfile to the working directory
@@ -1046,6 +1095,7 @@ class JobWrapper(HasResourceParameters):
 
         tool_evaluator = self._get_tool_evaluator(job)
         compute_environment = compute_environment or self.default_compute_environment(job)
+        self.galaxy_url = compute_environment.galaxy_url
         tool_evaluator.set_compute_environment(compute_environment, get_special=get_special)
 
         self.sa_session.flush()
@@ -1087,11 +1137,20 @@ class JobWrapper(HasResourceParameters):
             # The tool execution is given a working directory beneath the
             # "job" working directory.
             safe_makedirs(self.tool_working_directory)
+            safe_makedirs(os.path.join(working_directory, 'outputs'))
             log.debug('(%s) Working directory for job is: %s',
                       self.job_id, self.working_directory)
         except ObjectInvalid:
             raise Exception('(%s) Unable to create job working directory',
                             job.id)
+
+    @property
+    def guest_ports(self):
+        if hasattr(self, "interactivetools"):
+            guest_ports = [ep.get('port') for ep in self.interactivetools]
+            return guest_ports
+        else:
+            return []
 
     @property
     def working_directory(self):
@@ -1206,7 +1265,7 @@ class JobWrapper(HasResourceParameters):
             if exception:
                 # Save the traceback immediately in case we generate another
                 # below
-                job.traceback = traceback.format_exc()
+                job.traceback = unicodify(traceback.format_exc(), strip_null=True)
                 # Get the exception and let the tool attempt to generate
                 # a better message
                 etype, evalue, tb = sys.exc_info()
@@ -1316,26 +1375,11 @@ class JobWrapper(HasResourceParameters):
             log.warning("(%s) Ignoring state change from '%s' to '%s' for job "
                         "that is already terminal", job.id, job.state, state)
             return
-        for dataset_assoc in job.output_datasets + job.output_library_datasets:
-            dataset = dataset_assoc.dataset
-            if not job_supplied:
-                self.sa_session.refresh(dataset)
-            state_changed = dataset.raw_set_dataset_state(state)
-            if state_changed:
-                # Arguably a hack to get state changes to appear in the history panel because
-                # the history panel polls on hda.update_time and ignores hda.dataset.update_time.
-                # For those less pragmatic needing a more theoretically sound reason for the update,
-                # perhaps arguments can be made that the entity that is the HDA
-                # really should be described as updated since its effective state did change and its
-                # RESTful representation in the API does change as a result of the above dataset update.
-                dataset.update()
-            if info:
-                dataset.info = info
-            self.sa_session.add(dataset)
         if info:
             job.info = info
         job.set_state(state)
         self.sa_session.add(job)
+        job.update_output_states()
         if flush:
             self.sa_session.flush()
 
@@ -1361,6 +1405,14 @@ class JobWrapper(HasResourceParameters):
         job.destination_id = job_destination.id
         job.destination_params = job_destination.params
         job.job_runner_name = job_destination.runner
+        job.job_runner_external_id = external_id
+        self.sa_session.add(job)
+        if flush:
+            self.sa_session.flush()
+
+    def set_external_id(self, external_id, job=None, flush=True):
+        if job is None:
+            job = self.get_job()
         job.job_runner_external_id = external_id
         self.sa_session.add(job)
         if flush:
@@ -1515,7 +1567,10 @@ class JobWrapper(HasResourceParameters):
         the output datasets based on stderr and stdout from the command, and
         the contents of the output files.
         """
-        finish_timer = util.ExecutionTimer()
+        finish_timer = self.app.execution_timer_factory.get_timer(
+            'internals.galaxy.jobs.job_wrapper_finish',
+            'job_wrapper.finish for job ${job_id} executed'
+        )
 
         # default post job setup
         self.sa_session.expunge_all()
@@ -1539,6 +1594,8 @@ class JobWrapper(HasResourceParameters):
             # could also mean that a job was broken up into tasks and one of
             # the tasks failed. So include the stderr, stdout, and exit code:
             return fail()
+
+        extended_metadata = self.external_output_metadata.extended
 
         # We collect the stderr from tools that write their stderr to galaxy.json
         tool_provided_metadata = self.get_tool_provided_job_metadata()
@@ -1568,7 +1625,8 @@ class JobWrapper(HasResourceParameters):
                 os.unlink(version_filename)
 
         outputs_to_working_directory = util.asbool(self.get_destination_configuration("outputs_to_working_directory", False))
-        if outputs_to_working_directory and not self.__link_file_check():
+        if not extended_metadata and outputs_to_working_directory and not self.__link_file_check():
+            # output will be moved by job if metadata_strategy is extended_metadata, so skip moving here
             for dataset_path in self.get_output_fnames():
                 try:
                     shutil.move(dataset_path.false_path, dataset_path.real_path)
@@ -1586,15 +1644,35 @@ class JobWrapper(HasResourceParameters):
                         return self.fail("Job %s's output dataset(s) could not be read" % job.id)
 
         job_context = ExpressionContext(dict(stdout=job.stdout, stderr=job.stderr))
-        for dataset_assoc in job.output_datasets + job.output_library_datasets:
+        if extended_metadata:
+            try:
+                import_options = store.ImportOptions(allow_dataset_object_edit=True, allow_edit=True)
+                import_model_store = store.get_import_model_store_for_directory(os.path.join(self.working_directory, 'metadata', 'outputs_populated'), app=self.app, import_options=import_options)
+                import_model_store.perform_import(history=job.history)
+            except Exception:
+                log.exception("problem importing job outputs. stdout [%s] stderr [%s]" % (job.stdout, job.stderr))
+                raise
+        output_dataset_associations = job.output_datasets + job.output_library_datasets
+        for dataset_assoc in output_dataset_associations:
             context = self.get_dataset_finish_context(job_context, dataset_assoc)
             # should this also be checking library associations? - can a library item be added from a history before the job has ended? -
             # lets not allow this to occur
             # need to update all associated output hdas, i.e. history was shared with job running
             for dataset in dataset_assoc.dataset.dataset.history_associations + dataset_assoc.dataset.dataset.library_associations:
-                self._finish_dataset(
-                    dataset_assoc.name, dataset, job, context, final_job_state, remote_metadata_directory
-                )
+                output_name = dataset_assoc.name
+                standard_job_finish = not extended_metadata
+                if extended_metadata:
+                    if job.states.ERROR == final_job_state:
+                        dataset.blurb = "error"
+                        dataset.mark_unhidden()
+
+                if standard_job_finish:
+                    # Handles retry internally on error for instance...
+                    self._finish_dataset(
+                        output_name, dataset, job, context, final_job_state, remote_metadata_directory
+                    )
+
+        for dataset_assoc in output_dataset_associations:
             if job.states.ERROR == final_job_state:
                 log.debug("(%s) setting dataset %s state to ERROR", job.id, dataset_assoc.dataset.dataset.id)
                 # TODO: This is where the state is being set to error. Change it!
@@ -1604,13 +1682,14 @@ class JobWrapper(HasResourceParameters):
                     self.pause(dep_job_assoc.job, "Execution of this dataset's job is paused because its input datasets are in an error state.")
             else:
                 dataset_assoc.dataset.dataset.state = model.Dataset.states.OK
-            # If any of the rest of the finish method below raises an
-            # exception, the fail method will run and set the datasets to
-            # ERROR.  The user will never see that the datasets are in error if
-            # they were flushed as OK here, since upon doing so, the history
-            # panel stops checking for updates.  So allow the
-            # self.sa_session.flush() at the bottom of this method set
-            # the state instead.
+
+        # If any of the rest of the finish method below raises an
+        # exception, the fail method will run and set the datasets to
+        # ERROR.  The user will never see that the datasets are in error if
+        # they were flushed as OK here, since upon doing so, the history
+        # panel stops checking for updates.  So allow the
+        # self.sa_session.flush() at the bottom of this method set
+        # the state instead.
 
         for pja in job.post_job_actions:
             ActionBox.execute(self.app, self.sa_session, pja.post_job_action, job)
@@ -1625,23 +1704,25 @@ class JobWrapper(HasResourceParameters):
             job.exit_code = tool_exit_code
         # custom post process setup
         inp_data, out_data, out_collections = job.io_dicts()
-        self.discover_outputs(job, inp_data, out_data, out_collections)
+        if not extended_metadata:
+            # importing metadata will discover outputs if extended metadata
+            # is enabled.
+            self.discover_outputs(job, inp_data, out_data, out_collections, final_job_state=final_job_state)
+
         # Certain tools require tasks to be completed after job execution
         # ( this used to be performed in the "exec_after_process" hook, but hooks are deprecated ).
         param_dict = self.get_param_dict(job)
-        self.tool.exec_after_process(self.app, inp_data, out_data, param_dict, job=job)
+        self.tool.exec_after_process(self.app, inp_data, out_data, param_dict, job=job, final_job_state=final_job_state)
         # Call 'exec_after_process' hook
         self.tool.call_hook('exec_after_process', self.app, inp_data=inp_data,
                             out_data=out_data, param_dict=param_dict,
                             tool=self.tool, stdout=job.stdout, stderr=job.stderr)
-        job.command_line = unicodify(self.command_line)
 
         collected_bytes = 0
         # Once datasets are collected, set the total dataset size (includes extra files)
         for dataset_assoc in job.output_datasets:
             if not dataset_assoc.dataset.dataset.purged:
-                dataset_assoc.dataset.dataset.set_total_size()
-                collected_bytes += dataset_assoc.dataset.dataset.get_total_size()
+                collected_bytes += dataset_assoc.dataset.set_total_size()
 
         if job.user:
             job.user.adjust_total_disk_usage(collected_bytes)
@@ -1662,25 +1743,36 @@ class JobWrapper(HasResourceParameters):
         # dataset creation, and will allow us to eliminate force_history_refresh.
         job.set_final_state(final_job_state)
         if not job.tasks:
-            # If job was composed of tasks, don't attempt to recollect statisitcs
+            # If job was composed of tasks, don't attempt to recollect statistics
             self._collect_metrics(job, job_metrics_directory)
         self.sa_session.flush()
-        log.debug('job %d ended (finish() executed in %s)' % (self.job_id, finish_timer))
         if job.state == job.states.ERROR:
             self._report_error()
         cleanup_job = self.cleanup_job
         delete_files = cleanup_job == 'always' or (job.state == job.states.OK and cleanup_job == 'onsuccess')
         self.cleanup(delete_files=delete_files)
+        log.debug(finish_timer.to_str(job_id=self.job_id, tool_id=job.tool_id))
 
-    def discover_outputs(self, job, inp_data, out_data, out_collections):
-        input_ext = 'data'
-        input_dbkey = '?'
-        for _, data in inp_data.items():
-            # For loop odd, but sort simulating behavior in galaxy.tools.actions
-            if not data:
-                continue
-            input_ext = data.ext
-            input_dbkey = data.dbkey or '?'
+    def discover_outputs(self, job, inp_data, out_data, out_collections, final_job_state):
+        # Try to just recover input_ext and dbkey from job parameters (used and set in
+        # galaxy.tools.actions). Old jobs may have not set these in the job parameters
+        # before persisting them.
+        input_params = job.raw_param_dict()
+        input_ext = input_params.get("__input_ext")
+        input_dbkey = input_params.get("dbkey")
+        if input_ext is not None:
+            input_ext = loads(input_ext)
+            input_dbkey = loads(input_dbkey)
+        else:
+            # Legacy jobs without __input_ext.
+            input_ext = 'data'
+            input_dbkey = '?'
+            for _, data in inp_data.items():
+                # For loop odd, but sort simulating behavior in galaxy.tools.actions
+                if not data:
+                    continue
+                input_ext = data.ext
+                input_dbkey = data.dbkey or '?'
 
         # Create generated output children and primary datasets.
         tool_working_directory = self.tool_working_directory
@@ -1694,6 +1786,7 @@ class JobWrapper(HasResourceParameters):
             inp_data=inp_data,
             input_ext=input_ext,
             input_dbkey=input_dbkey,
+            final_job_state=final_job_state,
         )
 
     def check_tool_output(self, tool_stdout, tool_stderr, tool_exit_code, job, job_stdout=None, job_stderr=None):
@@ -1716,7 +1809,11 @@ class JobWrapper(HasResourceParameters):
         try:
             if delete_files:
                 for fname in self.extra_filenames:
-                    os.remove(fname)
+                    try:
+                        os.remove(fname)
+                    except EnvironmentError as e:
+                        if e.errno != errno.ENOENT:
+                            raise
                 self.external_output_metadata.cleanup_external_metadata(self.sa_session)
             galaxy.tools.imp_exp.JobExportHistoryArchiveWrapper(self.app, self.job_id).cleanup_after_job()
             galaxy.tools.imp_exp.JobImportHistoryArchiveWrapper(self.app, self.job_id).cleanup_after_job()
@@ -1802,11 +1899,20 @@ class JobWrapper(HasResourceParameters):
         paths = []
         for da in job.input_datasets + job.input_library_datasets:  # da is JobToInputDatasetAssociation object
             if da.dataset:
-                filenames = self.get_input_dataset_fnames(da.dataset)
-                for real_path in filenames:
-                    false_path = self.dataset_path_rewriter.rewrite_dataset_path(da.dataset, 'input')
-                    paths.append(DatasetPath(da.id, real_path=real_path, false_path=false_path, mutable=False))
+                paths.append(self.get_input_path(da.dataset))
         return paths
+
+    def get_input_path(self, dataset):
+        real_path = dataset.file_name
+        false_path = self.dataset_path_rewriter.rewrite_dataset_path(dataset, 'input')
+        return DatasetPath(
+            dataset.dataset.id,
+            real_path=real_path,
+            false_path=false_path,
+            mutable=False,
+            dataset_uuid=dataset.dataset.uuid,
+            object_store_id=dataset.dataset.object_store_id,
+        )
 
     def get_output_basenames(self):
         return [os.path.basename(str(fname)) for fname in self.get_output_fnames()]
@@ -1815,6 +1921,16 @@ class JobWrapper(HasResourceParameters):
         if self.output_paths is None:
             self.compute_outputs()
         return self.output_paths
+
+    def get_output_path(self, dataset):
+        if self.output_paths is None:
+            self.compute_outputs()
+        for (hda, dataset_path) in self.output_hdas_and_paths.values():
+            if hda == dataset:
+                return dataset_path
+        if getattr(dataset, "fake_dataset_association", False):
+            return dataset.file_name
+        raise KeyError("Couldn't find job output for [%s] in [%s]" % (dataset, self.output_hdas_and_paths.values()))
 
     def get_mutable_output_fnames(self):
         if self.output_paths is None:
@@ -1844,7 +1960,7 @@ class JobWrapper(HasResourceParameters):
         self.output_paths = [t[2] for t in results]
         self.output_hdas_and_paths = dict([(t[0], t[1:]) for t in results])
         if special:
-            false_path = dataset_path_rewriter.rewrite_dataset_path(special.dataset, 'output')
+            false_path = dataset_path_rewriter.rewrite_dataset_path(special, 'output')
             dsp = DatasetPath(special.dataset.id, special.dataset.file_name, false_path)
             self.output_paths.append(dsp)
         return self.output_paths
@@ -1907,7 +2023,8 @@ class JobWrapper(HasResourceParameters):
     def get_dataset_finish_context(self, job_context, output_dataset_assoc):
         meta = {}
         tool_provided_metadata = self.get_tool_provided_job_metadata()
-        meta = tool_provided_metadata.get_dataset_meta(output_dataset_assoc.name, output_dataset_assoc.dataset.dataset.id)
+        dataset = output_dataset_assoc.dataset.dataset
+        meta = tool_provided_metadata.get_dataset_meta(output_dataset_assoc.name, dataset.id, dataset.uuid)
         if meta:
             return ExpressionContext(meta, job_context)
         return job_context
@@ -1946,13 +2063,11 @@ class JobWrapper(HasResourceParameters):
             safe_makedirs(os.path.join(self.working_directory, 'metadata'))
             self.app.datatypes_registry.to_xml_file(path=datatypes_config)
 
-        output_datasets = {}
-        for output_dataset_assoc in job.output_datasets + job.output_library_datasets:
-            output_name = output_dataset_assoc.name
-            assert output_name not in output_datasets
-            output_datasets[output_dataset_assoc.name] = output_dataset_assoc.dataset
-
-        command = self.external_output_metadata.setup_external_metadata(output_datasets,
+        inp_data, out_data, out_collections = job.io_dicts(exclude_implicit_outputs=True)
+        job_metadata = os.path.join(self.tool_working_directory, self.tool.provided_metadata_file)
+        object_store_conf = self.object_store.to_dict()
+        command = self.external_output_metadata.setup_external_metadata(out_data,
+                                                                        out_collections,
                                                                         self.sa_session,
                                                                         exec_dir=exec_dir,
                                                                         tmp_dir=tmp_dir,
@@ -1960,7 +2075,11 @@ class JobWrapper(HasResourceParameters):
                                                                         config_root=config_root,
                                                                         config_file=config_file,
                                                                         datatypes_config=datatypes_config,
-                                                                        job_metadata=os.path.join(self.tool_working_directory, self.tool.provided_metadata_file),
+                                                                        job_metadata=job_metadata,
+                                                                        provided_metadata_style=self.tool.provided_metadata_style,
+                                                                        object_store_conf=object_store_conf,
+                                                                        tool=self.tool,
+                                                                        job=job,
                                                                         max_metadata_value_size=self.app.config.max_metadata_value_size,
                                                                         validate_outputs=self.validate_outputs,
                                                                         **kwds)
@@ -2000,28 +2119,36 @@ class JobWrapper(HasResourceParameters):
         if not container or not self.tool.produces_entry_points:
             return None
 
-        from os.path import abspath
-        from os import getcwd
-        exec_dir = kwds.get('exec_dir', abspath(getcwd()))
+        exec_dir = kwds.get('exec_dir', os.path.abspath(os.getcwd()))
         work_dir = self.working_directory
-        container_config = os.path.join(work_dir, "container_config.json")
+        configs_dir = ensure_configs_directory(work_dir)
+        container_config = os.path.join(configs_dir, "container_config.json")
+        self.extra_filenames.append(container_config)
 
-        # TODO: implement callback via URL callback for configuring ports instead
-        #       of fs polling.
-        # if self.app.config.galaxy_infrastructure_url_set:
-        #    # TODO: settable from job destination...
-        #    infrastructure_url = self.app.config.galaxy_infrastructure_url
-        # else:
-        #    infrastructure_url = "host.docker.internal"
+        # What should be done with the result... 'file' or 'callback'
+        result = self.get_destination_configuration("container_monitor_result", "file")
+        galaxy_url = self.galaxy_url()
+        container_config_dict = {
+            "container_name": container.container_name,
+            "container_type": container.container_type,
+            "connection_configuration": container.connection_configuration,
+        }
+        if result == "callback":
+            job_id = self.job_id
+            encoded_job_id = self.app.security.encode_id(job_id)
+            job_key = self.app.security.encode_id(job_id, kind="jobs_files")
+            endpoint_base = "%s/api/jobs/%s/ports?job_key=%s"
+            callback_url = endpoint_base % (
+                galaxy_url,
+                encoded_job_id,
+                job_key
+            )
+            container_config_dict["callback_url"] = callback_url
 
         with open(container_config, "w") as f:
-            json.dump({
-                "container_name": container.container_name,
-                "container_type": container.container_type,
-                "connection_configuration": container.connection_configuration,
-            }, f)
+            json.dump(container_config_dict, f)
 
-        return "(python '%s'/lib/galaxy_ext/container_monitor/monitor.py &) " % exec_dir
+        return "(python '%s'/lib/galaxy_ext/container_monitor/monitor.py &); sleep 1 " % exec_dir
 
     @property
     def user(self):
@@ -2081,13 +2208,10 @@ class JobWrapper(HasResourceParameters):
             cmd = shlex.split(external_chown_script)
             cmd.extend([self.working_directory, username, str(gid)])
             log.debug('(%s) Changing ownership of working directory with: %s' % (job.id, ' '.join(cmd)))
-            p = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = p.communicate()
-            if p.returncode != 0:
-                log.error('external script failed.')
-                log.error('stdout was: %s' % stdout)
-                log.error('stderr was: %s' % stderr)
-            assert p.returncode == 0
+            try:
+                commands.execute(cmd)
+            except commands.CommandLineException as e:
+                log.error('external script failed: %s' % unicodify(e))
 
     def change_ownership_for_run(self):
         job = self.get_job()
@@ -2097,7 +2221,7 @@ class JobWrapper(HasResourceParameters):
                 self._change_ownership(self.user_system_pwent[0], str(self.user_system_pwent[3]))
             except Exception:
                 log.exception('(%s) Failed to change ownership of %s, making world-writable instead' % (job.id, self.working_directory))
-                os.chmod(self.working_directory, 0o777)
+                os.chmod(self.working_directory, RWXRWXRWX)
 
     def reclaim_ownership(self):
         job = self.get_job()
@@ -2121,7 +2245,7 @@ class JobWrapper(HasResourceParameters):
     def get_output_destination(self, output_path):
         """
         Destination for outputs marked as from_work_dir. This is the normal case,
-        just copy these files directly to the ulimate destination.
+        just copy these files directly to the ultimate destination.
         """
         return output_path
 
@@ -2201,7 +2325,8 @@ class TaskWrapper(JobWrapper):
 
         self.sa_session.flush()
 
-        self.command_line, self.extra_filenames, self.environment_variables = tool_evaluator.build()
+        self.command_line, extra_filenames, self.environment_variables = tool_evaluator.build()
+        self.extra_filenames.extend(extra_filenames)
 
         # Ensure galaxy_lib_dir is set in case there are any later chdirs
         self.galaxy_lib_dir
@@ -2344,12 +2469,28 @@ class ComputeEnvironment(object):
         """ Output unqualified filenames defined by job. """
 
     @abstractmethod
-    def output_paths(self):
-        """ Output DatasetPaths defined by job. """
+    def input_path_rewrite(self, dataset):
+        """Input path for specified dataset."""
 
     @abstractmethod
-    def input_paths(self):
-        """ Input DatasetPaths defined by job. """
+    def output_path_rewrite(self, dataset):
+        """Output path for specified dataset."""
+
+    @abstractmethod
+    def input_extra_files_rewrite(self, dataset):
+        """Input extra files path rewrite for specified dataset."""
+
+    @abstractmethod
+    def output_extra_files_rewrite(self, dataset):
+        """Output extra files path rewrite for specified dataset."""
+
+    @abstractmethod
+    def input_metadata_rewrite(self, dataset, metadata_value):
+        """Input metadata path rewrite for specified dataset."""
+
+    @abstractmethod
+    def unstructured_path_rewrite(self, path):
+        """Rewrite loc file paths, etc.."""
 
     @abstractmethod
     def working_directory(self):
@@ -2377,14 +2518,6 @@ class ComputeEnvironment(object):
         """ Location of the version file for the underlying tool. """
 
     @abstractmethod
-    def unstructured_path_rewriter(self):
-        """ Return a function that takes in a value, determines if it is path
-        to be rewritten (will be passed non-path values as well - onus is on
-        this function to determine both if its input is a path and if it should
-        be rewritten.)
-        """
-
-    @abstractmethod
     def home_directory(self):
         """Home directory of target job - none if HOME should not be set."""
 
@@ -2392,17 +2525,18 @@ class ComputeEnvironment(object):
     def tmp_directory(self):
         """Temp directory of target job - none if HOME should not be set."""
 
+    @abstractmethod
+    def galaxy_url(self):
+        """URL to access Galaxy API from for this compute environment."""
+
 
 class SimpleComputeEnvironment(object):
 
     def config_directory(self):
-        return self.working_directory()
+        return os.path.join(self.working_directory(), "configs")
 
     def sep(self):
         return os.path.sep
-
-    def unstructured_path_rewriter(self):
-        return lambda v: v
 
 
 class SharedComputeEnvironment(SimpleComputeEnvironment):
@@ -2422,8 +2556,27 @@ class SharedComputeEnvironment(SimpleComputeEnvironment):
     def output_paths(self):
         return self.job_wrapper.get_output_fnames()
 
-    def input_paths(self):
-        return self.job_wrapper.get_input_paths(self.job)
+    def input_path_rewrite(self, dataset):
+        return self.job_wrapper.get_input_path(dataset).false_path
+
+    def output_path_rewrite(self, dataset):
+        dataset_path = self.job_wrapper.get_output_path(dataset)
+        if hasattr(dataset_path, "false_path"):
+            return dataset_path.false_path
+        else:
+            return dataset_path
+
+    def input_extra_files_rewrite(self, dataset):
+        return None
+
+    def output_extra_files_rewrite(self, dataset):
+        return None
+
+    def input_metadata_rewrite(self, dataset, metadata_value):
+        return None
+
+    def unstructured_path_rewrite(self, path):
+        return None
 
     def working_directory(self):
         return self.job_wrapper.working_directory
@@ -2445,6 +2598,9 @@ class SharedComputeEnvironment(SimpleComputeEnvironment):
 
     def tmp_directory(self):
         return self.job_wrapper.tmp_directory()
+
+    def galaxy_url(self):
+        return self.job_wrapper.get_destination_configuration("galaxy_infrastructure_url")
 
 
 class NoopQueue(object):

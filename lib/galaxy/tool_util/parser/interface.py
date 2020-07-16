@@ -1,3 +1,4 @@
+import os
 from abc import (
     ABCMeta,
     abstractmethod
@@ -113,7 +114,7 @@ class ToolSource(object):
         return ["TMPDIR", "TMP", "TEMP"]
 
     def parse_docker_env_pass_through(self):
-        return ["GALAXY_SLOTS", "HOME"] + self.parse_tmp_directory_vars()
+        return ["GALAXY_SLOTS", "HOME", "_GALAXY_JOB_HOME_DIR", "_GALAXY_JOB_TMP_DIR"] + self.parse_tmp_directory_vars()
 
     @abstractmethod
     def parse_interpreter(self):
@@ -229,14 +230,25 @@ class ToolSource(object):
         Return minimum python version that the tool template has been developed against.
         """
 
+    @property
     def macro_paths(self):
         return []
+
+    @property
+    def source_path(self):
+        return None
+
+    def paths_and_modtimes(self):
+        paths_and_modtimes = {p: os.path.getmtime(p) for p in self.macro_paths}
+        if self.source_path:
+            paths_and_modtimes[self.source_path] = os.path.getmtime(self.source_path)
+        return paths_and_modtimes
 
     def parse_tests_to_dict(self):
         return {'tests': []}
 
     def __str__(self):
-        source_path = getattr(self, "_soure_path", None)
+        source_path = self.source_path
         if source_path:
             as_str = u'%s[%s]' % (self.__class__.__name__, source_path)
         else:
@@ -399,7 +411,7 @@ class TestCollectionDef(object):
             "model_class": "TestCollectionDef",
             "attributes": self.attrib,
             "collection_type": self.collection_type,
-            "elements": map(element_to_dict, self.elements or []),
+            "elements": list(map(element_to_dict, self.elements or [])),
             "name": self.name,
         }
 

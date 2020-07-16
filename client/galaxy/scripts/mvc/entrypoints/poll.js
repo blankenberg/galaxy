@@ -10,10 +10,9 @@ export const clearPolling = () => {
 export const pollUntilActive = (onUpdate, onError, params) => {
     clearPolling();
     const url = getAppRoot() + `api/entry_points`;
-    console.log(params);
     axios
         .get(url, { params: params })
-        .then(response => {
+        .then((response) => {
             const entryPoints = [];
             let allReady = true;
             response.data.forEach((entryPoint, i) => {

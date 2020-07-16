@@ -3,7 +3,7 @@ Galaxy web framework helpers
 
 The functions in this module should be considered part of the API used by
 visualizations in their mako files through the `$h` object, see
-GalaxyWebTransaction in galaxy/web/framework/webapp.py
+GalaxyWebTransaction in galaxy/webapps/base/webapp.py
 """
 from datetime import datetime, timedelta
 
@@ -71,6 +71,15 @@ def css(*args):
     return stylesheet_link(*urls)
 
 
+def dist_css(*args):
+    """
+    Transition function 'css' helper -- this is the modern way where all bundled
+    artifacts are in the unified 'dist'.
+    """
+    urls = (url_for("/static/dist/%s.css?v=%s" % (name, server_starttime)) for name in args)
+    return stylesheet_link(*urls)
+
+
 def js_helper(prefix, *args):
     """
     Take a prefix and list of javascript names and return appropriate
@@ -88,6 +97,14 @@ def js(*args):
     string of script tags.
     """
     return js_helper('static/scripts/', *args)
+
+
+def dist_js(*args):
+    """
+    Transition function 'js' helper -- this is the modern way where all bundled
+    artifacts are in the unified 'dist'.
+    """
+    return js_helper('static/dist/', *args)
 
 
 def templates(*args):

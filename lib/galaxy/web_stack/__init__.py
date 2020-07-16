@@ -228,10 +228,10 @@ class UWSGIApplicationStack(MessageApplicationStack):
     Note that mules will use this as their stack class even though they start with the "webless" loading point.
     """
     name = 'uWSGI'
-    prohibited_middleware = frozenset([
+    prohibited_middleware = frozenset({
         'wrap_in_static',
         'EvalException',
-    ])
+    })
     transport_class = UWSGIFarmMessageTransport
     log_filter_class = UWSGILogFilter
     log_format = '%(name)s %(levelname)s %(asctime)s [p:%(process)s,w:%(worker_id)s,m:%(mule_id)s] [%(threadName)s] %(message)s'
@@ -538,7 +538,7 @@ class WeblessApplicationStack(ApplicationStack):
                 or (dialect.name == 'mysql' and dialect.server_version_info >= (8, 0, 1))):
             add_method = HANDLER_ASSIGNMENT_METHODS.DB_SKIP_LOCKED
         else:
-            HANDLER_ASSIGNMENT_METHODS.DB_TRANSACTION_ISOLATION
+            add_method = HANDLER_ASSIGNMENT_METHODS.DB_TRANSACTION_ISOLATION
         if add_method in job_config.UNSUPPORTED_HANDLER_ASSIGNMENT_METHODS:
             remove_methods.append(add_method)
             add_method = HANDLER_ASSIGNMENT_METHODS.DB_PREASSIGN

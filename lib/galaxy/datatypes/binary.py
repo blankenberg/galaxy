@@ -3,6 +3,7 @@ from __future__ import print_function
 
 import binascii
 import gzip
+import io
 import logging
 import os
 import shutil
@@ -248,6 +249,16 @@ class CompressedZipArchive(CompressedArchive):
         except Exception:
             return "Compressed zip file (%s)" % (nice_size(dataset.get_size()))
 
+    def sniff(self, filename):
+        with zipfile.ZipFile(filename) as zf:
+            zf_files = zf.infolist()
+            count = 0
+            for f in zf_files:
+                if f.file_size > 0 and not f.filename.startswith('__MACOSX/') and not f.filename.endswith('.DS_Store'):
+                    count += 1
+                if count > 1:
+                    return True
+
 
 class GenericAsn1Binary(Binary):
     """Class for generic ASN.1 binary format"""
@@ -448,6 +459,21 @@ class Bam(BamNative):
     data_sources = {"data": "bai", "index": "bigwig"}
 
     MetadataElement(name="bam_index", desc="BAM Index File", param=metadata.FileParameter, file_ext="bai", readonly=True, no_value=None, visible=False, optional=True)
+    MetadataElement(name="bam_csi_index", desc="BAM CSI Index File", param=metadata.FileParameter, file_ext="bam.csi", readonly=True, no_value=None, visible=False, optional=True)
+
+    def get_index_flag(self, file_name):
+        """
+        Return pysam flag for bai index (default) or csi index (contig size > (2**29 - 1) )
+        """
+        index_flag = '-b'  # bai index
+        try:
+            with pysam.AlignmentFile(file_name) as alignment_file:
+                if max(alignment_file.header.lengths) > (2 ** 29) - 1:
+                    index_flag = '-c'  # csi index
+        except Exception:
+            # File may not have a header, that's OK
+            pass
+        return index_flag
 
     def dataset_content_needs_grooming(self, file_name):
         """
@@ -455,12 +481,17 @@ class Bam(BamNative):
         """
         # The best way to ensure that BAM files are coordinate-sorted and indexable
         # is to actually index them.
+        index_flag = self.get_index_flag(file_name)
         index_name = tempfile.NamedTemporaryFile(prefix="bam_index").name
         try:
             # If pysam fails to index a file it will write to stderr,
             # and this causes the set_meta script to fail. So instead
             # we start another process and discard stderr.
-            cmd = ['python', '-c', "import pysam; pysam.index('%s', '%s')" % (file_name, index_name)]
+            if index_flag == '-b':
+                # IOError: No such file or directory: '-b' if index_flag is set to -b (pysam 0.15.4)
+                cmd = ['python', '-c', "import pysam; pysam.index('%s', '%s')" % (file_name, index_name)]
+            else:
+                cmd = ['python', '-c', "import pysam; pysam.index('%s', '%s', '%s')" % (index_flag, file_name, index_name)]
             with open(os.devnull, 'w') as devnull:
                 subprocess.check_call(cmd, stderr=devnull, shell=False)
             needs_sorting = False
@@ -475,10 +506,20 @@ class Bam(BamNative):
     def set_meta(self, dataset, overwrite=True, **kwd):
         # These metadata values are not accessible by users, always overwrite
         super(Bam, self).set_meta(dataset=dataset, overwrite=overwrite, **kwd)
-        index_file = dataset.metadata.bam_index
+        index_flag = self.get_index_flag(dataset.file_name)
+        if index_flag == '-b':
+            spec_key = 'bam_index'
+            index_file = dataset.metadata.bam_index
+        else:
+            spec_key = 'bam_csi_index'
+            index_file = dataset.metadata.bam_csi_index
         if not index_file:
-            index_file = dataset.metadata.spec['bam_index'].param.new_file(dataset=dataset)
-        pysam.index(dataset.file_name, index_file.file_name)
+            index_file = dataset.metadata.spec[spec_key].param.new_file(dataset=dataset)
+        if index_flag == '-b':
+            # IOError: No such file or directory: '-b' if index_flag is set to -b (pysam 0.15.4)
+            pysam.index(dataset.file_name, index_file.file_name)
+        else:
+            pysam.index(index_flag, dataset.file_name, index_file.file_name)
         dataset.metadata.bam_index = index_file
 
     def sniff(self, file_name):
@@ -957,7 +998,7 @@ class Trr(GmxBinary):
     """
 
     file_ext = "trr"
-    magic_number = 1993  # magic number reference: https://github.com/gromacs/gromacs/blob/1c6639f0636d2ffc3d665686756d77227c8ae6d1/src/gromacs/fileio/trrio.cpp
+    magic_number = 1993  # magic number reference: https://github.com/gromacs/gromacs/blob/cec211b2c835ba6e8ea849fb1bf67d7fc19693a4/src/gromacs/fileio/trrio.cpp
 
 
 class Cpt(GmxBinary):
@@ -992,6 +1033,23 @@ class Xtc(GmxBinary):
 
     file_ext = "xtc"
     magic_number = 1995  # reference: https://github.com/gromacs/gromacs/blob/cec211b2c835ba6e8ea849fb1bf67d7fc19693a4/src/gromacs/fileio/xtcio.cpp
+
+
+class Edr(GmxBinary):
+    """
+    Class describing an edr file from the GROMACS suite
+
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname('md.edr')
+    >>> Edr().sniff(fname)
+    True
+    >>> fname = get_test_fname('md.trr')
+    >>> Edr().sniff(fname)
+    False
+    """
+
+    file_ext = "edr"
+    magic_number = -55555  # reference: https://github.com/gromacs/gromacs/blob/cec211b2c835ba6e8ea849fb1bf67d7fc19693a4/src/gromacs/fileio/enxio.cpp
 
 
 class Biom2(H5):
@@ -1102,8 +1160,8 @@ class Cool(H5):
         if super(Cool, self).sniff(filename):
             keys = ['chroms', 'bins', 'pixels', 'indexes']
             with h5py.File(filename, 'r') as handle:
-                fmt = handle.attrs.get('format')
-                url = handle.attrs.get('format-url')
+                fmt = util.unicodify(handle.attrs.get('format'))
+                url = util.unicodify(handle.attrs.get('format-url'))
                 if fmt == MAGIC or url == URL:
                     if not all(name in handle.keys() for name in keys):
                         return False
@@ -1162,8 +1220,8 @@ class MCool(H5):
                     return False
                 res0 = list(handle['resolutions'].keys())[0]
                 keys = ['chroms', 'bins', 'pixels', 'indexes']
-                fmt = handle['resolutions'][res0].attrs.get('format')
-                url = handle['resolutions'][res0].attrs.get('format-url')
+                fmt = util.unicodify(handle['resolutions'][res0].attrs.get('format'))
+                url = util.unicodify(handle['resolutions'][res0].attrs.get('format-url'))
                 if fmt == MAGIC or url == URL:
                     if not all(name in handle['resolutions'][res0].keys() for name in keys):
                         return False
@@ -1378,6 +1436,22 @@ class SQlite(Binary):
         except Exception:
             return False
 
+    def sniff_table_names(self, filename, table_names):
+        # All table names should be in the schema
+        try:
+            conn = sqlite.connect(filename)
+            c = conn.cursor()
+            tables_query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            result = c.execute(tables_query).fetchall()
+            result = [_[0] for _ in result]
+            for table_name in table_names:
+                if table_name not in result:
+                    return False
+            return True
+        except Exception as e:
+            log.warning('%s, sniff Exception: %s', self, e)
+        return False
+
     def set_peek(self, dataset, is_multi_byte=False):
         if not dataset.dataset.purged:
             dataset.peek = "SQLite Database"
@@ -1439,20 +1513,9 @@ class GeminiSQLite(SQlite):
 
     def sniff(self, filename):
         if super(GeminiSQLite, self).sniff(filename):
-            gemini_table_names = ["gene_detailed", "gene_summary", "resources", "sample_genotype_counts", "sample_genotypes", "samples",
-                                  "variant_impacts", "variants", "version"]
-            try:
-                conn = sqlite.connect(filename)
-                c = conn.cursor()
-                tables_query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-                result = c.execute(tables_query).fetchall()
-                result = [_[0] for _ in result]
-                for table_name in gemini_table_names:
-                    if table_name not in result:
-                        return False
-                return True
-            except Exception as e:
-                log.warning('%s, sniff Exception: %s', self, e)
+            table_names = ["gene_detailed", "gene_summary", "resources", "sample_genotype_counts",
+                           "sample_genotypes", "samples", "variant_impacts", "variants", "version"]
+            return self.sniff_table_names(filename, table_names)
         return False
 
     def set_peek(self, dataset, is_multi_byte=False):
@@ -1468,6 +1531,19 @@ class GeminiSQLite(SQlite):
             return dataset.peek
         except Exception:
             return "Gemini SQLite Database, version %s" % (dataset.metadata.gemini_version or 'unknown')
+
+
+class ChiraSQLite(SQlite):
+    """Class describing a ChiRAViz Sqlite database """
+    file_ext = "chira.sqlite"
+
+    def set_meta(self, dataset, overwrite=True, **kwd):
+        super(ChiraSQLite, self).set_meta(dataset, overwrite=overwrite, **kwd)
+
+    def sniff(self, filename):
+        if super(ChiraSQLite, self).sniff(filename):
+            self.sniff_table_names(filename, ['Chimeras'])
+        return False
 
 
 class CuffDiffSQlite(SQlite):
@@ -1514,20 +1590,8 @@ class CuffDiffSQlite(SQlite):
     def sniff(self, filename):
         if super(CuffDiffSQlite, self).sniff(filename):
             # These tables should be in any CuffDiff SQLite output.
-            cuffdiff_table_names = ['CDS', 'genes', 'isoforms', 'replicates',
-                                    'runInfo', 'samples', 'TSS']
-            try:
-                conn = sqlite.connect(filename)
-                c = conn.cursor()
-                tables_query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-                result = c.execute(tables_query).fetchall()
-                result = [_[0] for _ in result]
-                for table_name in cuffdiff_table_names:
-                    if table_name not in result:
-                        return False
-                return True
-            except Exception as e:
-                log.warning('%s, sniff Exception: %s', self, e)
+            table_names = ['CDS', 'genes', 'isoforms', 'replicates', 'runInfo', 'samples', 'TSS']
+            return self.sniff_table_names(filename, table_names)
         return False
 
     def set_peek(self, dataset, is_multi_byte=False):
@@ -1542,7 +1606,7 @@ class CuffDiffSQlite(SQlite):
         try:
             return dataset.peek
         except Exception:
-            return "CuffDiff SQLite Database, version %s" % (dataset.metadata.gemini_version or 'unknown')
+            return "CuffDiff SQLite Database, version %s" % (dataset.metadata.cuffdiff_version or 'unknown')
 
 
 class MzSQlite(SQlite):
@@ -1554,19 +1618,94 @@ class MzSQlite(SQlite):
 
     def sniff(self, filename):
         if super(MzSQlite, self).sniff(filename):
-            mz_table_names = ["DBSequence", "Modification", "Peaks", "Peptide", "PeptideEvidence", "Score", "SearchDatabase", "Source", "SpectraData", "Spectrum", "SpectrumIdentification"]
-            try:
-                conn = sqlite.connect(filename)
-                c = conn.cursor()
-                tables_query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-                result = c.execute(tables_query).fetchall()
-                result = [_[0] for _ in result]
-                for table_name in mz_table_names:
-                    if table_name not in result:
-                        return False
-                return True
-            except Exception as e:
-                log.warning('%s, sniff Exception: %s', self, e)
+            table_names = ["DBSequence", "Modification", "Peaks", "Peptide", "PeptideEvidence",
+                           "Score", "SearchDatabase", "Source", "SpectraData", "Spectrum", "SpectrumIdentification"]
+            return self.sniff_table_names(filename, table_names)
+        return False
+
+
+class PQP(SQlite):
+    """
+    Class describing a Peptide query parameters file
+
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname('test.pqp')
+    >>> PQP().sniff(fname)
+    True
+    >>> fname = get_test_fname('test.osw')
+    >>> PQP().sniff(fname)
+    False
+    """
+    file_ext = "pqp"
+
+    def set_meta(self, dataset, overwrite=True, **kwd):
+        super(PQP, self).set_meta(dataset, overwrite=overwrite, **kwd)
+
+    def sniff(self, filename):
+        """
+        table definition according to https://github.com/grosenberger/OpenMS/blob/develop/src/openms/source/ANALYSIS/OPENSWATH/TransitionPQPFile.cpp#L264
+        for now VERSION GENE PEPTIDE_GENE_MAPPING are excluded, since
+        there is test data wo these tables, see also here https://github.com/OpenMS/OpenMS/issues/4365
+        """
+        if not super(PQP, self).sniff(filename):
+            return False
+        table_names = ['COMPOUND', 'PEPTIDE', 'PEPTIDE_PROTEIN_MAPPING', 'PRECURSOR',
+                       'PRECURSOR_COMPOUND_MAPPING', 'PRECURSOR_PEPTIDE_MAPPING', 'PROTEIN',
+                       'TRANSITION', 'TRANSITION_PEPTIDE_MAPPING', 'TRANSITION_PRECURSOR_MAPPING']
+        osw_table_names = ['FEATURE', 'FEATURE_MS1', 'FEATURE_MS2', 'FEATURE_TRANSITION', 'RUN']
+        return self.sniff_table_names(filename, table_names) and not self.sniff_table_names(filename, osw_table_names)
+
+
+class OSW(SQlite):
+    """
+    Class describing OpenSwath output
+
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname('test.osw')
+    >>> OSW().sniff(fname)
+    True
+    >>> fname = get_test_fname('test.sqmass')
+    >>> OSW().sniff(fname)
+    False
+    """
+    file_ext = "osw"
+
+    def set_meta(self, dataset, overwrite=True, **kwd):
+        super(OSW, self).set_meta(dataset, overwrite=overwrite, **kwd)
+
+    def sniff(self, filename):
+        # osw seems to be an extension of pqp (few tables are added)
+        # see also here https://github.com/OpenMS/OpenMS/issues/4365
+        if not super(OSW, self).sniff(filename):
+            return False
+        table_names = ['COMPOUND', 'PEPTIDE', 'PEPTIDE_PROTEIN_MAPPING', 'PRECURSOR',
+                       'PRECURSOR_COMPOUND_MAPPING', 'PRECURSOR_PEPTIDE_MAPPING', 'PROTEIN',
+                       'TRANSITION', 'TRANSITION_PEPTIDE_MAPPING', 'TRANSITION_PRECURSOR_MAPPING',
+                       'FEATURE', 'FEATURE_MS1', 'FEATURE_MS2', 'FEATURE_TRANSITION', 'RUN']
+        return self.sniff_table_names(filename, table_names)
+
+
+class SQmass(SQlite):
+    """
+    Class describing a Sqmass database
+
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname('test.sqmass')
+    >>> SQmass().sniff(fname)
+    True
+    >>> fname = get_test_fname('test.pqp')
+    >>> SQmass().sniff(fname)
+    False
+    """
+    file_ext = "sqmass"
+
+    def set_meta(self, dataset, overwrite=True, **kwd):
+        super(SQmass, self).set_meta(dataset, overwrite=overwrite, **kwd)
+
+    def sniff(self, filename):
+        if super(SQmass, self).sniff(filename):
+            table_names = ["CHROMATOGRAM", "PRECURSOR", "RUN", "SPECTRUM", "DATA", "PRODUCT", "RUN_EXTRA"]
+            return self.sniff_table_names(filename, table_names)
         return False
 
 
@@ -1589,19 +1728,90 @@ class BlibSQlite(SQlite):
 
     def sniff(self, filename):
         if super(BlibSQlite, self).sniff(filename):
-            blib_table_names = ['IonMobilityTypes', 'LibInfo', 'Modifications', 'RefSpectra', 'RefSpectraPeakAnnotations', 'RefSpectraPeaks', 'ScoreTypes', 'SpectrumSourceFiles']
-            try:
-                conn = sqlite.connect(filename)
-                c = conn.cursor()
-                tables_query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-                result = c.execute(tables_query).fetchall()
-                result = [_[0] for _ in result]
-                for table_name in blib_table_names:
-                    if table_name not in result:
-                        return False
-                return True
-            except Exception as e:
-                log.warning('%s, sniff Exception: %s', self, e)
+            table_names = ['IonMobilityTypes', 'LibInfo', 'Modifications', 'RefSpectra',
+                           'RefSpectraPeakAnnotations', 'RefSpectraPeaks', 'ScoreTypes', 'SpectrumSourceFiles']
+            return self.sniff_table_names(filename, table_names)
+        return False
+
+
+class DlibSQlite(SQlite):
+    """
+    Class describing a Proteomics Spectral Library Sqlite database
+    DLIBs only have the "entries", "metadata", and "peptidetoprotein" tables populated.
+    ELIBs have the rest of the tables populated too, such as "peptidequants" or "peptidescores".
+
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname('test.dlib')
+    >>> DlibSQlite().sniff(fname)
+    True
+    >>> fname = get_test_fname('interval.interval')
+    >>> DlibSQlite().sniff(fname)
+    False
+    """
+    MetadataElement(name="dlib_version", default='1.8', param=MetadataParameter, desc="Dlib Version",
+                    readonly=True, visible=True, no_value='1.8')
+    file_ext = "dlib"
+
+    def set_meta(self, dataset, overwrite=True, **kwd):
+        super(DlibSQlite, self).set_meta(dataset, overwrite=overwrite, **kwd)
+        try:
+            conn = sqlite.connect(dataset.file_name)
+            c = conn.cursor()
+            tables_query = "SELECT Value FROM metadata WHERE Key = 'version'"
+            version = c.execute(tables_query).fetchall()[0]
+            dataset.metadata.dlib_version = '%s' % (version)
+        except Exception as e:
+            log.warning('%s, set_meta Exception: %s', self, e)
+
+    def sniff(self, filename):
+        if super(DlibSQlite, self).sniff(filename):
+            table_names = ['entries', 'metadata', 'peptidetoprotein']
+            return self.sniff_table_names(filename, table_names)
+        return False
+
+
+class ElibSQlite(SQlite):
+    """
+    Class describing a Proteomics Chromatagram Library Sqlite database
+    DLIBs only have the "entries", "metadata", and "peptidetoprotein" tables populated.
+    ELIBs have the rest of the tables populated too, such as "peptidequants" or "peptidescores".
+
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname('test.elib')
+    >>> ElibSQlite().sniff(fname)
+    True
+    >>> fname = get_test_fname('test.dlib')
+    >>> ElibSQlite().sniff(fname)
+    False
+    """
+    MetadataElement(name="version", default='0.1.14', param=MetadataParameter, desc="Elib Version",
+                    readonly=True, visible=True, no_value='0.1.14')
+    file_ext = "elib"
+
+    def set_meta(self, dataset, overwrite=True, **kwd):
+        super(ElibSQlite, self).set_meta(dataset, overwrite=overwrite, **kwd)
+        try:
+            conn = sqlite.connect(dataset.file_name)
+            c = conn.cursor()
+            tables_query = "SELECT Value FROM metadata WHERE Key = 'version'"
+            version = c.execute(tables_query).fetchall()[0]
+            dataset.metadata.dlib_version = '%s' % (version)
+        except Exception as e:
+            log.warning('%s, set_meta Exception: %s', self, e)
+
+    def sniff(self, filename):
+        if super(ElibSQlite, self).sniff(filename):
+            table_names = ['entries', 'fragmentquants', 'metadata', 'peptidelocalizations', 'peptidequants',
+                           'peptidescores', 'peptidetoprotein', 'proteinscores', 'retentiontimes']
+            if self.sniff_table_names(filename, table_names):
+                try:
+                    conn = sqlite.connect(filename)
+                    c = conn.cursor()
+                    row_query = "SELECT count(*) FROM peptidescores"
+                    count = c.execute(row_query).fetchone()[0]
+                    return int(count) > 0
+                except Exception as e:
+                    log.warning('%s, sniff Exception: %s', self, e)
         return False
 
 
@@ -1624,19 +1834,9 @@ class IdpDB(SQlite):
 
     def sniff(self, filename):
         if super(IdpDB, self).sniff(filename):
-            mz_table_names = ["About", "Analysis", "AnalysisParameter", "PeptideSpectrumMatch", "Spectrum", "SpectrumSource"]
-            try:
-                conn = sqlite.connect(filename)
-                c = conn.cursor()
-                tables_query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-                result = c.execute(tables_query).fetchall()
-                result = [_[0] for _ in result]
-                for table_name in mz_table_names:
-                    if table_name not in result:
-                        return False
-                return True
-            except Exception as e:
-                log.warning('%s, sniff Exception: %s', self, e)
+            table_names = ["About", "Analysis", "AnalysisParameter", "PeptideSpectrumMatch",
+                           "Spectrum", "SpectrumSource"]
+            return self.sniff_table_names(filename, table_names)
         return False
 
     def set_peek(self, dataset, is_multi_byte=False):
@@ -1677,14 +1877,63 @@ class GAFASQLite(SQlite):
 
     def sniff(self, filename):
         if super(GAFASQLite, self).sniff(filename):
-            gafa_table_names = frozenset(['gene', 'gene_family', 'gene_family_member', 'meta', 'transcript'])
-            conn = sqlite.connect(filename)
-            c = conn.cursor()
-            tables_query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-            results = c.execute(tables_query).fetchall()
-            found_table_names = frozenset(_[0] for _ in results)
-            return gafa_table_names <= found_table_names
+            table_names = frozenset({'gene', 'gene_family', 'gene_family_member', 'meta', 'transcript'})
+            return self.sniff_table_names(filename, table_names)
         return False
+
+
+class NcbiTaxonomySQlite(SQlite):
+    """Class describing the NCBI Taxonomy database stored in SQLite as done by rust-ncbitaxonomy"""
+    MetadataElement(name='ncbitaxonomy_schema_version', default='20200501095116', param=MetadataParameter, desc='ncbitaxonomy schema version',
+                    readonly=True, visible=True, no_value='20200501095116')
+    MetadataElement(name="taxon_count", default=[], param=MetadataParameter, desc="Count of taxa in the taxonomy",
+                    readonly=True, visible=True, no_value=[])
+
+    file_ext = 'ncbitaxonomy.sqlite'
+
+    def set_meta(self, dataset, overwrite=True, **kwd):
+        super(NcbiTaxonomySQlite, self).set_meta(dataset, overwrite=overwrite, **kwd)
+        try:
+            conn = sqlite.connect(dataset.file_name)
+            c = conn.cursor()
+            version_query = 'SELECT version FROM __diesel_schema_migrations ORDER BY run_on DESC LIMIT 1'
+            results = c.execute(version_query).fetchall()
+            if len(results) == 0:
+                raise Exception('version not found in __diesel_schema_migrations table')
+            dataset.metadata.ncbitaxonomy_schema_version = results[0][0]
+            taxons_query = 'SELECT count(name) FROM taxonomy'
+            results = c.execute(taxons_query).fetchall()
+            if len(results) == 0:
+                raise Exception('could not count size of taxonomy table')
+            dataset.metadata.taxon_count = results[0][0]
+        except Exception as e:
+            log.warning("%s, set_meta Exception: %s", self, e)
+
+    def sniff(self, filename):
+        if super(NcbiTaxonomySQlite, self).sniff(filename):
+            table_names = frozenset({'__diesel_schema_migrations', 'taxonomy'})
+            return self.sniff_table_names(filename, table_names)
+        return False
+
+    def set_peek(self, dataset, is_multi_byte=False):
+        if not dataset.dataset.purged:
+            dataset.peek = "NCBI Taxonomy SQLite Database, version {} ({} taxons)".format(
+                getattr(dataset.metadata, "ncbitaxonomy_schema_version", "unknown"),
+                getattr(dataset.metadata, "taxon_count", "unknown")
+            )
+            dataset.blurb = nice_size(dataset.get_size())
+        else:
+            dataset.peek = 'file does not exist'
+            dataset.blurb = 'file purged from disk'
+
+    def display_peek(self, dataset):
+        try:
+            return dataset.peek
+        except Exception:
+            return "NCBI Taxonomy SQLite Database, version {} ({} taxons)".format(
+                getattr(dataset.metadata, "ncbitaxonomy_schema_version", "unknown"),
+                getattr(dataset.metadata, "taxon_count", "unknown")
+            )
 
 
 class Xlsx(Binary):
@@ -2111,7 +2360,7 @@ class SearchGuiArchive(CompressedArchive):
                 with zipfile.ZipFile(dataset.file_name) as tempzip:
                     if 'searchgui.properties' in tempzip.namelist():
                         with tempzip.open('searchgui.properties') as fh:
-                            for line in fh:
+                            for line in io.TextIOWrapper(fh):
                                 if line.startswith('searchgui.version'):
                                     version = line.split('=')[1].strip()
                                     dataset.metadata.searchgui_version = version

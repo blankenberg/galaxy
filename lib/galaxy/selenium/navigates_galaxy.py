@@ -50,6 +50,10 @@ WAIT_TYPES = Bunch(
     JOB_COMPLETION=WaitType("job_completion", 30),
     # Wait time for a GIE to spawn.
     GIE_SPAWN=WaitType("gie_spawn", 30),
+    # Wait time for toolshed search
+    SHED_SEARCH=WaitType('shed_search', 30),
+    # Wait time for repository installation
+    REPO_INSTALL=WaitType('repo_install', 60),
 )
 
 # Choose a moderate wait type for operations that don't specify a type.
@@ -207,20 +211,28 @@ class NavigatesGalaxy(HasDriver):
     def history_panel_name(self):
         return self.history_panel_name_element().text
 
+    def history_contents(self, history_id=None, view='summary', datasets_only=True):
+        if history_id is None:
+            history_id = self.current_history_id()
+        histories = self.api_get('histories?keys=id')
+        if history_id not in [h['id'] for h in histories]:
+            return {}
+        if datasets_only:
+            endpoint = 'histories/%s/contents?view=%s' % (history_id, view)
+        else:
+            endpoint = 'histories/%s?view=%s' % (history_id, view)
+        return self.api_get(endpoint)
+
     def current_history(self):
-        history = self.api_get("histories")[0]
-        return history
+        full_url = self.build_url("history/current_history_json", for_selenium=False)
+        response = requests.get(full_url, cookies=self.selenium_to_requests_cookies())
+        return response.json()
 
     def current_history_id(self):
         return self.current_history()["id"]
 
-    def current_history_contents(self):
-        current_history_id = self.current_history_id()
-        history_contents = self.api_get("histories/%s/contents" % current_history_id)
-        return history_contents
-
     def latest_history_item(self):
-        history_contents = self.current_history_contents()
+        history_contents = self.history_contents()
         assert len(history_contents) > 0
         return history_contents[-1]
 
@@ -350,19 +362,25 @@ class NavigatesGalaxy(HasDriver):
 
     def published_grid_search_for(self, search_term=None):
         return self._inline_search_for(
-            '#input-free-text-search-filter',
+            self.navigation.grids.free_text_search,
             search_term,
         )
 
     def get_logged_in_user(self):
         return self.api_get("users/current")
 
+    def get_api_key(self):
+        user = self.get_logged_in_user()
+        return self.api_get("users/%s/api_key/inputs" % user["id"])["inputs"][0]["value"]
+
     def is_logged_in(self):
         return "email" in self.get_logged_in_user()
 
     @retry_during_transitions
     def _inline_search_for(self, selector, search_term=None):
-        search_box = self.wait_for_and_click_selector(selector)
+        # Clear tooltip resulting from clicking on the masthead to get here.
+        self.clear_tooltips()
+        search_box = self.wait_for_and_click(selector)
         search_box.clear()
         if search_term is not None:
             search_box.send_keys(search_term)
@@ -381,6 +399,12 @@ class NavigatesGalaxy(HasDriver):
         domain = domain or 'test.test'
         return self._get_random_name(prefix=username, suffix="@" + domain)
 
+    # Creates a random password of length len by creating an array with all ASCII letters and the numbers 0 to 9,
+    # then using the random number generator to pick one elemenent to concatinate it to the end of the password string until
+    # we have a password of length len.
+    def _get_random_password(self, len=6):
+        return ''.join(random.SystemRandom().choice(string.ascii_letters + string.digits) for _ in range(len))
+
     def submit_login(self, email, password=None, assert_valid=True, retries=0):
         if password is None:
             password = self.default_password
@@ -388,7 +412,7 @@ class NavigatesGalaxy(HasDriver):
             'login': email,
             'password': password,
         }
-        self.click_masthead_user()
+        self.components.masthead.register_or_login.wait_for_and_click()
         self.sleep_for(WAIT_TYPES.UX_RENDER)
         form = self.wait_for_visible(self.navigation.login.selectors.form)
         self.fill(form, login_info)
@@ -417,7 +441,7 @@ class NavigatesGalaxy(HasDriver):
             username = email.split("@")[0]
 
         self.home()
-        self.click_masthead_user()
+        self.components.masthead.register_or_login.wait_for_and_click()
         self.wait_for_and_click(self.navigation.registration.selectors.toggle)
         form = self.wait_for_visible(self.navigation.registration.selectors.form)
         self.fill(form, dict(
@@ -427,20 +451,16 @@ class NavigatesGalaxy(HasDriver):
             confirm=confirm
         ))
         self.wait_for_and_click(self.navigation.registration.selectors.submit)
-        # Give the browser a bit of time to submit the request.
-        # It would be good to eliminate this sleep, but it can't be because Galaxy
-        # doesn't swap the "User" menu automatically after it registers a user and
-        # and the donemessage visible comment below doesn't work when using Selenium.
-        # Something about the Selenium session or quickness of registering causes the
-        # following in the Galaxy logs which gets propaged to the GUI as a generic error:
-        # /api/histories/cfc05ccec54895e2/contents?keys=type_id%2Celement_count&order=hid&v=dev&q=history_content_type&q=deleted&q=purged&q=visible&qv=dataset_collection&qv=False&qv=False&qv=True HTTP/1.1" 403 - "http://localhost:8080/"
-        # Like the logged in user doesn't have permission to the previously anonymous user's
-        # history, it is odd but I cannot replicate this outside of Selenium.
-        time.sleep(1.35)
+        if assert_valid is False:
+            self.assert_error_message()
+        elif assert_valid:
+            self.wait_for_logged_in()
 
-        if assert_valid:
-            # self.wait_for_selector_visible(".donemessage")
+            # Code below previously was needed because there was a bug that would prevent the masthead from changing,
+            # the bug seems maybe to be fixed though - so we could consider eliminating these extra checks to speed
+            # up tests.
             self.home()
+            self.wait_for_logged_in()
             self.click_masthead_user()
             # Make sure the user menu was dropped down
             user_menu = self.components.masthead.user_menu.wait_for_visible()
@@ -456,20 +476,25 @@ class NavigatesGalaxy(HasDriver):
             assert email in text
             assert self.get_logged_in_user()["email"] == email
 
-            # Hide masthead menu click
-            self.click_center()
+            # clicking away no longer closes menu post Masthead -> VueJS
+            self.click_masthead_user()
 
     def wait_for_logged_in(self):
         try:
-            self.wait_for_visible(self.navigation.masthead.selectors.logged_in_only)
+            self.components.masthead.logged_in_only.wait_for_visible()
         except self.TimeoutException as e:
+            ui_logged_out = self.components.masthead.logged_out_only.is_displayed
+            if ui_logged_out:
+                dom_message = "Element a.loggedout-only is present in DOM, indicating Login or Register button still in masthead."
+            else:
+                dom_message = "Element a.loggedout-only is *not* present in DOM."
             user_info = self.api_get("users/current")
             if "username" in user_info:
-                template = "Failed waiting for masthead to update for login, but user API response indicates [%s] is logged in. This seems to be a bug in Galaxy. API response was [%s]. "
-                message = template % (user_info["username"], user_info)
+                template = "Failed waiting for masthead to update for login, but user API response indicates [%s] is logged in. This seems to be a bug in Galaxy. %s logged API response was [%s]. "
+                message = template % (user_info["username"], dom_message, user_info)
                 raise self.prepend_timeout_message(e, message)
             else:
-                raise NotLoggedInException(e, user_info)
+                raise NotLoggedInException(e, user_info, dom_message)
 
     def click_center(self):
         action_chains = self.action_chains()
@@ -815,7 +840,7 @@ class NavigatesGalaxy(HasDriver):
         return self.wait_for_and_click_selector("#workflow-options-button")
 
     def workflow_editor_options_menu_element(self):
-        return self.wait_for_selector_visible("#workflow-options-button-menu")
+        return self.wait_for_selector_visible("#workflow-options-button")
 
     def workflow_editor_click_run(self):
         return self.wait_for_and_click_selector("#workflow-run-button")
@@ -823,6 +848,11 @@ class NavigatesGalaxy(HasDriver):
     def workflow_editor_click_save(self):
         self.wait_for_and_click_selector("#workflow-save-button")
         self.sleep_for(self.wait_types.DATABASE_OPERATION)
+
+    def navigate_to_user_preferences(self):
+        self.home()
+        self.click_masthead_user()
+        self.components.masthead.preferences.wait_for_and_click()
 
     def admin_open(self):
         self.components.masthead.admin.wait_for_and_click()
@@ -935,13 +965,19 @@ class NavigatesGalaxy(HasDriver):
         self.wait_for_selector_absent_or_hidden(".ui-modal", wait_type=WAIT_TYPES.UX_POPUP)
         self.wait_for_selector_absent_or_hidden(".toast", wait_type=WAIT_TYPES.UX_POPUP)
 
+    def clear_tooltips(self):
+        action_chains = self.action_chains()
+        center_element = self.driver.find_element_by_css_selector("#center")
+        action_chains.move_to_element(center_element).perform()
+        self.wait_for_selector_absent_or_hidden(".b-tooltip", wait_type=WAIT_TYPES.UX_POPUP)
+
     def workflow_index_open(self):
         self.home()
         self.click_masthead_workflow()
 
     def workflow_index_table_elements(self):
-        self.wait_for_selector_visible("tbody.workflow-search")
-        table_elements = self.driver.find_elements_by_css_selector("tbody.workflow-search > tr:not([style*='display: none'])")
+        self.wait_for_selector_visible("#workflow-table")
+        table_elements = self.driver.find_elements_by_css_selector("#workflow-table > tbody > tr:not([style*='display: none'])")
         return table_elements
 
     def workflow_index_table_row(self, workflow_index=0):
@@ -954,11 +990,11 @@ class NavigatesGalaxy(HasDriver):
         return columns[column_index].text
 
     def workflow_index_click_search(self):
-        return self.wait_for_and_click_selector("input.search-wf")
+        return self.wait_for_and_click_selector("#workflow-search")
 
     def workflow_index_search_for(self, search_term=None):
         return self._inline_search_for(
-            "input.search-wf",
+            self.navigation.workflows.search_box,
             search_term,
         )
 
@@ -975,19 +1011,17 @@ class NavigatesGalaxy(HasDriver):
     def workflow_index_name(self, workflow_index=0):
         """Get workflow name for workflow_index'th row."""
         row_element = self.workflow_index_table_row(workflow_index=workflow_index)
-        workflow_button = row_element.find_element_by_css_selector("a.btn.btn-secondary")
+        workflow_button = row_element.find_element_by_css_selector(".workflow-dropdown")
         return workflow_button.text
 
+    @retry_during_transitions
+    def workflow_click_option(self, workflow_selector, workflow_index=0):
+        workflow_row = self.workflow_index_table_row(workflow_index=workflow_index)
+        workflow_button = workflow_row.find_element_by_css_selector(workflow_selector)
+        workflow_button.click()
+
     def workflow_index_click_option(self, option_title, workflow_index=0):
-
-        @retry_during_transitions
-        def click_option():
-            workflow_row = self.workflow_index_table_row(workflow_index=workflow_index)
-            workflow_button = workflow_row.find_element_by_css_selector("button.dropdown-toggle")
-            workflow_button.click()
-
-        click_option()
-
+        self.workflow_click_option(".workflow-dropdown", workflow_index)
         menu_element = self.wait_for_selector_visible(".dropdown-menu.show")
         menu_options = menu_element.find_elements_by_css_selector("a.dropdown-item")
         found_option = False
@@ -1276,10 +1310,18 @@ class NavigatesGalaxy(HasDriver):
     def logout_if_needed(self):
         if self.is_logged_in():
             self.home()
-            self.click_masthead_user()
-            self.wait_for_and_click(self.navigation.masthead.labels.logout)
-            self.sleep_for(WAIT_TYPES.UX_TRANSITION)
-            assert not self.is_logged_in()
+            self.logout()
+
+    def logout(self):
+        self.components.masthead.logged_in_only.wait_for_visible()
+        self.click_masthead_user()
+        self.components.masthead.logout.wait_for_and_click()
+        try:
+            self.components.masthead.logged_out_only.wait_for_visible()
+        except self.TimeoutException as e:
+            message = "Clicked logout button but waiting for 'Login or Registration' button failed, perhaps the logout button was clicked before the handler was setup?"
+            raise self.prepend_timeout_message(e, message)
+        assert not self.is_logged_in(), "Clicked to logged out and UI reflects a logout, but API still thinks a user is logged in."
 
     def run_tour(self, path, skip_steps=None, sleep_on_steps=None, tour_callback=None):
         skip_steps = skip_steps or []
@@ -1372,13 +1414,15 @@ class NavigatesGalaxy(HasDriver):
         assert text == expected, "Tooltip text [%s] was not expected text [%s]." % (text, expected)
 
     def assert_error_message(self, contains=None):
-        return self._assert_message("error", contains=contains)
+        element = self.components._.messages["error"]
+        return self.assert_message(element, contains=contains)
 
     def assert_warning_message(self, contains=None):
-        return self._assert_message("warning", contains=contains)
+        element = self.components._.messages["warning"]
+        return self.assert_message(element, contains=contains)
 
-    def _assert_message(self, message_type, contains=None):
-        element = self.components._.messages[message_type].wait_for_visible()
+    def assert_message(self, element, contains=None):
+        element = element.wait_for_visible()
         assert element, "No error message found, one expected."
         if contains is not None:
             text = element.text
@@ -1429,6 +1473,27 @@ class NavigatesGalaxy(HasDriver):
         element.click()
         return element
 
+    def set_history_annotation(self, annotation, clear_text=False):
+        self.ensure_history_annotation_area_displayed()
+
+        self.wait_for_and_click(self.navigation.history_panel.selectors.annotation_editable_text)
+
+        annon_area_editable = self.wait_for_and_click(self.navigation.history_panel.selectors.annotation_edit)
+        anno_done_button = self.wait_for_clickable(self.navigation.history_panel.selectors.annotation_done)
+
+        if clear_text:
+            annon_area_editable.clear()
+
+        annon_area_editable.send_keys(annotation)
+        anno_done_button.click()
+
+    def ensure_history_annotation_area_displayed(self):
+        annotation_area_selector = self.navigation.history_panel.selectors.annotation_area
+        annotation_icon_selector = self.navigation.history_panel.selectors.annotation_icon
+
+        if not self.is_displayed(annotation_area_selector):
+            self.wait_for_and_click(annotation_icon_selector)
+
     def select2_set_value(self, container_selector_or_elem, value, with_click=True, clear_value=False):
         # There are two hacky was to select things from the select2 widget -
         #   with_click=True: This simulates the mouse click after the suggestion contains
@@ -1468,9 +1533,9 @@ class NavigatesGalaxy(HasDriver):
 
 class NotLoggedInException(TimeoutException):
 
-    def __init__(self, timeout_exception, user_info):
-        template = "Waiting for UI to reflect user logged in but it did not occur. API indicates no user is currently logged in. API response was [%s]. %s"
-        msg = template % (user_info, timeout_exception.msg)
+    def __init__(self, timeout_exception, user_info, dom_message):
+        template = "Waiting for UI to reflect user logged in but it did not occur. API indicates no user is currently logged in. %s API response was [%s]. %s"
+        msg = template % (dom_message, user_info, timeout_exception.msg)
         super(NotLoggedInException, self).__init__(
             msg=msg,
             screen=timeout_exception.screen,

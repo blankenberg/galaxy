@@ -26,13 +26,27 @@ from galaxy.managers import (
 )
 from galaxy.tools.actions import upload_common
 from galaxy.tools.parameters import populate_state
-from galaxy.util.path import full_path_permission_for_user, safe_contains, safe_relpath, unsafe_walk
+from galaxy.util.path import (
+    full_path_permission_for_user,
+    safe_contains,
+    safe_relpath,
+    unsafe_walk,
+)
 from galaxy.util.streamball import StreamBall
 from galaxy.web import (
     expose_api,
     expose_api_anonymous,
 )
-from galaxy.webapps.base.controller import BaseAPIController, UsesVisualizationMixin
+from galaxy.webapps.base.controller import (
+    BaseAPIController,
+    UsesVisualizationMixin,
+)
+
+try:
+    maketrans = str.maketrans
+except AttributeError:
+    from string import maketrans
+
 log = logging.getLogger(__name__)
 
 
@@ -414,7 +428,7 @@ class LibraryDatasetsController(BaseAPIController, UsesVisualizationMixin, Libra
                 raise exceptions.ConfigDoesNotAllowException('The configuration of this Galaxy instance does not allow upload from user directories.')
             full_dir = os.path.join(user_base_dir, user_login)
 
-            if not safe_contains(full_dir, path, whitelist=trans.app.config.user_library_import_symlink_whitelist):
+            if not safe_contains(full_dir, path, allowlist=trans.app.config.user_library_import_symlink_allowlist):
                 # the path is a symlink outside the user dir
                 path = os.path.join(full_dir, path)
                 log.error('User attempted to import a path that resolves to a path outside of their import dir: %s -> %s', path, os.path.realpath(path))
@@ -424,7 +438,7 @@ class LibraryDatasetsController(BaseAPIController, UsesVisualizationMixin, Libra
                         '%s -> %s and cannot be read by them.', path, os.path.realpath(path))
                 raise exceptions.RequestParameterInvalidException('The given path is invalid.')
             path = os.path.join(full_dir, path)
-            for unsafe in unsafe_walk(path, whitelist=[full_dir] + trans.app.config.user_library_import_symlink_whitelist, username=username):
+            for unsafe in unsafe_walk(path, allowlist=[full_dir] + trans.app.config.user_library_import_symlink_allowlist, username=username):
                 # the path is a dir and contains files that symlink outside the user dir
                 error = 'User attempted to import a path that resolves to a path outside of their import dir: %s -> %s', \
                         path, os.path.realpath(path)
@@ -575,7 +589,7 @@ class LibraryDatasetsController(BaseAPIController, UsesVisualizationMixin, Libra
         if format in ['zip', 'tgz', 'tbz']:
             # error = False
             killme = string.punctuation + string.whitespace
-            trantab = string.maketrans(killme, '_' * len(killme))
+            trantab = maketrans(killme, '_' * len(killme))
             try:
                 outext = 'zip'
                 if format == 'zip':

@@ -42,6 +42,7 @@ class TabularData(data.Text):
     edam_format = "format_3475"
     # All tabular data is chunkable.
     CHUNKABLE = True
+    data_line_offset = 0
 
     """Add metadata elements"""
     MetadataElement(name="comment_lines", default=0, desc="Number of comment lines", readonly=False, optional=True, no_value=0)
@@ -80,7 +81,9 @@ class TabularData(data.Text):
                     cursor = f.read(1)
             last_read = f.tell()
         return dumps({'ck_data': util.unicodify(ck_data),
-                      'offset': last_read})
+                      'offset': last_read,
+                      'data_line_offset': self.data_line_offset,
+                      })
 
     def display_data(self, trans, dataset, preview=False, filename=None, to_ext=None, offset=None, ck_size=None, **kwd):
         preview = util.string_as_bool(preview)
@@ -89,7 +92,7 @@ class TabularData(data.Text):
         elif to_ext or not preview:
             to_ext = to_ext or dataset.extension
             return self._serve_raw(trans, dataset, to_ext, **kwd)
-        elif dataset.metadata.columns > 50:
+        elif dataset.metadata.columns > 100:
             # Fancy tabular display is only suitable for datasets without an incredibly large number of columns.
             # We should add a new datatype 'matrix', with its own draw method, suitable for this kind of data.
             # For now, default to the old behavior, ugly as it is.  Remove this after adding 'matrix'.
@@ -120,6 +123,13 @@ class TabularData(data.Text):
                                        column_number=column_number,
                                        column_names=column_names,
                                        column_types=column_types)
+
+    def display_as_markdown(self, dataset_instance, markdown_format_helpers):
+        contents = open(dataset_instance.file_name, "r").read(data.DEFAULT_MAX_PEEK_SIZE)
+        markdown = self.make_html_table(dataset_instance, peek=contents)
+        if len(contents) == data.DEFAULT_MAX_PEEK_SIZE:
+            markdown += markdown_format_helpers.indicate_data_truncated()
+        return markdown_format_helpers.pre_formatted_contents(markdown)
 
     def make_html_table(self, dataset, **kwargs):
         """Create HTML table, used for displaying peek"""
@@ -184,27 +194,31 @@ class TabularData(data.Text):
             skipchars = []
         out = []
         try:
-            if not dataset.peek:
-                dataset.set_peek()
+            peek = kwargs.get("peek")
+            if peek is None:
+                if not dataset.peek:
+                    dataset.set_peek()
+                peek = dataset.peek
             columns = dataset.metadata.columns
             if columns is None:
                 columns = dataset.metadata.spec.columns.no_value
-            for line in dataset.peek.splitlines():
-                if line.startswith(tuple(skipchars)):
-                    out.append('<tr><td colspan="100%%">%s</td></tr>' % escape(line))
-                elif line:
-                    elems = line.split(dataset.metadata.delimiter)
-                    # pad shortened elems, since lines could have been truncated by width
-                    if len(elems) < columns:
-                        elems.extend([''] * (columns - len(elems)))
-                    # we may have an invalid comment line or invalid data
-                    if len(elems) != columns:
+            for i, line in enumerate(peek.splitlines()):
+                if i >= self.data_line_offset:
+                    if line.startswith(tuple(skipchars)):
                         out.append('<tr><td colspan="100%%">%s</td></tr>' % escape(line))
-                    else:
-                        out.append('<tr>')
-                        for elem in elems:
-                            out.append('<td>%s</td>' % escape(elem))
-                        out.append('</tr>')
+                    elif line:
+                        elems = line.split(dataset.metadata.delimiter)
+                        # pad shortened elems, since lines could have been truncated by width
+                        if len(elems) < columns:
+                            elems.extend([''] * (columns - len(elems)))
+                        # we may have an invalid comment line or invalid data
+                        if len(elems) != columns:
+                            out.append('<tr><td colspan="100%%">%s</td></tr>' % escape(line))
+                        else:
+                            out.append('<tr>')
+                            for elem in elems:
+                                out.append('<td>%s</td>' % escape(elem))
+                            out.append('</tr>')
         except Exception as exc:
             log.exception('make_html_peek_rows failed on HDA %s', dataset.id)
             raise Exception("Can't create peek rows: %s" % util.unicodify(exc))
@@ -246,6 +260,9 @@ class TabularData(data.Text):
 @dataproviders.decorators.has_dataproviders
 class Tabular(TabularData):
     """Tab delimited data"""
+
+    def get_column_names(self, first_line=None):
+        return None
 
     def set_meta(self, dataset, overwrite=True, skip=None, max_data_lines=100000, max_guess_type_data_lines=None, **kwd):
         """
@@ -329,6 +346,7 @@ class Tabular(TabularData):
             return None
         data_lines = 0
         comment_lines = 0
+        column_names = None
         column_types = []
         first_line_column_types = [default_column_type]  # default value is one column of type str
         if dataset.has_data():
@@ -340,6 +358,8 @@ class Tabular(TabularData):
                     if not line:
                         break
                     line = line.rstrip('\r\n')
+                    if i == 0:
+                        column_names = self.get_column_names(first_line=line)
                     if i < skip or not line or line.startswith('#'):
                         # We'll call blank lines comments
                         comment_lines += 1
@@ -394,12 +414,27 @@ class Tabular(TabularData):
         dataset.metadata.column_types = column_types
         dataset.metadata.columns = len(column_types)
         dataset.metadata.delimiter = '\t'
+        if column_names is not None:
+            dataset.metadata.column_names = column_names
 
     def as_gbrowse_display_file(self, dataset, **kwd):
         return open(dataset.file_name, 'rb')
 
     def as_ucsc_display_file(self, dataset, **kwd):
         return open(dataset.file_name, 'rb')
+
+
+class SraManifest(Tabular):
+    """A manifest received from the sra_source tool."""
+    ext = 'sra_manifest.tabular'
+    data_line_offset = 1
+
+    def set_meta(self, dataset, **kwds):
+        super(SraManifest, self).set_meta(dataset, **kwds)
+        dataset.metadata.comment_lines = 1
+
+    def get_column_names(self, first_line):
+        return first_line.strip().split('\t')
 
 
 class Taxonomy(Tabular):
@@ -815,7 +850,7 @@ class Eland(Tabular):
                              'PART_CONTIG', 'PART_OFFSET', 'PART_STRAND', 'FILT'
                              ]
 
-    def make_html_table(self, dataset, skipchars=None):
+    def make_html_table(self, dataset, skipchars=None, peek=None):
         """Create HTML table, used for displaying peek"""
         if skipchars is None:
             skipchars = []
@@ -830,7 +865,7 @@ class Eland(Tabular):
                 for i in range(len(self.column_names), dataset.metadata.columns):
                     out.append('<th>%s</th>' % str(i + 1))
                 out.append('</tr>')
-            out.append(self.make_html_peek_rows(dataset, skipchars=skipchars))
+            out.append(self.make_html_peek_rows(dataset, skipchars=skipchars, peek=peek))
             out.append('</table>')
             out = "".join(out)
         except Exception as exc:

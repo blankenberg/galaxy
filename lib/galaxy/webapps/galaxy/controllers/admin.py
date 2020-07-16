@@ -3,7 +3,6 @@ import logging
 import os
 from collections import OrderedDict
 from datetime import datetime, timedelta
-from string import punctuation as PUNCTUATION
 
 import six
 from sqlalchemy import and_, false, or_
@@ -16,21 +15,19 @@ from galaxy import (
 from galaxy.actions.admin import AdminActions
 from galaxy.exceptions import ActionInputError, MessageException
 from galaxy.model import tool_shed_install as install_model
+from galaxy.security.validate_user_input import validate_password
+from galaxy.tool_shed.util.repository_util import get_ids_of_tool_shed_repositories_being_installed
 from galaxy.util import (
     nice_size,
     sanitize_text,
     url_get
 )
+from galaxy.util.tool_shed import common_util, encoding_util
 from galaxy.web import url_for
 from galaxy.web.framework.helpers import grids, time_ago
 from galaxy.web.params import QuotaParamParser
 from galaxy.webapps.base import controller
 from galaxy.webapps.base.controller import UsesQuotaMixin
-from tool_shed.util import (
-    common_util,
-    encoding_util,
-    repository_util
-)
 from tool_shed.util.web_util import escape
 
 
@@ -534,6 +531,8 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
         condition=(lambda item: not item.deleted and not item.purged),
         allow_multiple=False
     )
+    activate_operation = grids.GridOperation("Activate User", condition=(lambda item: not item.active), allow_multiple=False)
+    resend_activation_email = grids.GridOperation("Resend Activation Email", condition=(lambda item: not item.active), allow_multiple=False)
 
     @web.expose
     @web.require_admin
@@ -550,7 +549,7 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
         status = kwd.get('status', 'done')
         settings = {
             'is_repo_installed': trans.install_model.context.query(trans.install_model.ToolShedRepository).first() is not None,
-            'installing_repository_ids': repository_util.get_ids_of_tool_shed_repositories_being_installed(trans.app, as_string=True),
+            'installing_repository_ids': get_ids_of_tool_shed_repositories_being_installed(trans.app, as_string=True),
             'is_tool_shed_installed': bool(trans.app.tool_shed_registry and trans.app.tool_shed_registry.tool_sheds)
         }
         return self._bootstrapped_client(trans, app_name='admin', settings=settings, message=message, status=status)
@@ -617,6 +616,13 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
                 message, status = self._recalculate_user(trans, id)
             elif operation == 'generate new api key':
                 message, status = self._new_user_apikey(trans, id)
+            elif operation == 'activate user':
+                message, status = self._activate_user(trans, id)
+            elif operation == 'resend activation email':
+                message, status = self._resend_activation_email(trans, id)
+        if message and status:
+            kwd['message'] = util.sanitize_text(message)
+            kwd['status'] = status
         if trans.app.config.allow_user_deletion:
             if self.delete_operation not in self.user_list_grid.operations:
                 self.user_list_grid.operations.append(self.delete_operation)
@@ -627,9 +633,10 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
         if trans.app.config.allow_user_impersonation:
             if self.impersonate_operation not in self.user_list_grid.operations:
                 self.user_list_grid.operations.append(self.impersonate_operation)
-        if message and status:
-            kwd['message'] = util.sanitize_text(message)
-            kwd['status'] = status
+        if trans.app.config.user_activation_on:
+            if self.activate_operation not in self.user_list_grid.operations:
+                self.user_list_grid.operations.append(self.activate_operation)
+                self.user_list_grid.operations.append(self.resend_activation_email)
         return self.user_list_grid(trans, **kwd)
 
     @web.legacy_expose_api
@@ -867,7 +874,7 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
                     changeset_revision = elem.get('changeset_revision')
                     params = dict(name=repository_name, owner='devteam', changeset_revision=changeset_revision)
                     pathspec = ['repository', 'get_tool_dependencies']
-                    text = url_get(shed_url, password_mgr=self.app.tool_shed_registry.url_auth(shed_url), pathspec=pathspec, params=params)
+                    text = url_get(shed_url, auth=self.app.tool_shed_registry.url_auth(shed_url), pathspec=pathspec, params=params)
                     if text:
                         tool_dependencies_dict = encoding_util.tool_shed_decode(text)
                         for dependency_key, requirements_dict in tool_dependencies_dict.items():
@@ -886,7 +893,7 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
         status = util.restore_text(kwd.get('status', 'done'))
         migration_stages_dict = OrderedDict()
         # FIXME: this isn't valid in an installed context
-        migration_scripts_dir = os.path.abspath(os.path.join(trans.app.config.root, 'lib', 'tool_shed', 'galaxy_install', 'migrate', 'versions'))
+        migration_scripts_dir = os.path.abspath(os.path.join(trans.app.config.root, 'lib', 'galaxy', 'tool_shed', 'galaxy_install', 'migrate', 'versions'))
         modules = os.listdir(migration_scripts_dir)
         modules.sort()
         modules.reverse()
@@ -903,19 +910,6 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
             migration_stages_dict[migration_stage] = (migration_info, repo_name_dependency_tups)
         return trans.fill_template('admin/review_tool_migration_stages.mako',
                                    migration_stages_dict=migration_stages_dict,
-                                   message=message,
-                                   status=status)
-
-    @web.expose
-    @web.require_admin
-    def center(self, trans, **kwd):
-        message = escape(kwd.get('message', ''))
-        status = kwd.get('status', 'done')
-        is_repo_installed = trans.install_model.context.query(trans.install_model.ToolShedRepository).first() is not None
-        installing_repository_ids = repository_util.get_ids_of_tool_shed_repositories_being_installed(trans.app, as_string=True)
-        return trans.fill_template('/webapps/galaxy/admin/center.mako',
-                                   is_repo_installed=is_repo_installed,
-                                   installing_repository_ids=installing_repository_ids,
                                    message=message,
                                    status=status)
 
@@ -1394,10 +1388,9 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
             else:
                 password = payload.get('password')
                 confirm = payload.get('confirm')
-                if len(password) < 6:
-                    return self.message_exception(trans, 'Use a password of at least 6 characters.')
-                elif password != confirm:
-                    return self.message_exception(trans, 'Passwords do not match.')
+                message = validate_password(trans, password, confirm)
+                if message:
+                    return self.message_exception(trans, message)
                 for user in users.values():
                     user.set_password_cleartext(password)
                     trans.sa_session.add(user)
@@ -1473,6 +1466,22 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
         trans.sa_session.flush()
         return ("New key '%s' generated for requested user '%s'." % (new_key.key, user.email), "done")
 
+    def _activate_user(self, trans, user_id):
+        user = trans.sa_session.query(trans.model.User).get(trans.security.decode_id(user_id))
+        if not user:
+            return ('User not found for id (%s)' % sanitize_text(str(user_id)), 'error')
+        self.user_manager.activate(user)
+        return ('Activated user: %s.' % user.email, 'done')
+
+    def _resend_activation_email(self, trans, user_id):
+        user = trans.sa_session.query(trans.model.User).get(trans.security.decode_id(user_id))
+        if not user:
+            return ('User not found for id (%s)' % sanitize_text(str(user_id)), 'error')
+        if self.user_manager.send_activation_email(trans, user.email, user.username):
+            return ('Activation email has been sent to user: %s.' % user.email, 'done')
+        else:
+            return ('Unable to send activation email to user: %s.' % user.email, 'error')
+
     @web.legacy_expose_api
     @web.require_admin
     def manage_roles_and_groups_for_user(self, trans, payload=None, **kwd):
@@ -1524,47 +1533,9 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
     @web.expose
     @web.json
     @web.require_admin
-    def jobs_control(self, trans, job_lock=None, **kwd):
-        if job_lock is not None:
-            job_lock = True if job_lock == 'true' else False
-            trans.app.queue_worker.send_control_task('admin_job_lock', kwargs={'job_lock': job_lock}, get_response=True)
-        job_lock = trans.app.job_manager.job_lock
-        return {'job_lock': job_lock}
-
-    @web.expose
-    @web.json
-    @web.require_admin
-    def jobs_list(self, trans, stop=[], stop_msg=None, cutoff=180, **kwd):
-        deleted = []
+    def jobs_list(self, trans, cutoff=180, **kwd):
         message = kwd.get('message', '')
         status = kwd.get('status', 'info')
-        job_ids = util.listify(stop)
-        if job_ids and stop_msg in [None, '']:
-            message = 'Please enter an error message to display to the user describing why the job was terminated'
-            return self.message_exception(trans, message)
-        elif job_ids:
-            if stop_msg[-1] not in PUNCTUATION:
-                stop_msg += '.'
-            for job_id in job_ids:
-                error_msg = "This job was stopped by an administrator: %s  <a href='%s' target='_blank'>Contact support</a> for additional help." \
-                    % (stop_msg, self.app.config.get("support_url", "https://galaxyproject.org/support/"))
-                if trans.app.config.track_jobs_in_database:
-                    job = trans.sa_session.query(trans.app.model.Job).get(job_id)
-                    job.job_stderr = error_msg
-                    job.set_state(trans.app.model.Job.states.DELETED_NEW)
-                    trans.sa_session.add(job)
-                else:
-                    trans.app.job_manager.stop(job, message=error_msg)
-                deleted.append(str(job_id))
-        if deleted:
-            message = 'Queued job'
-            if len(deleted) > 1:
-                message += 's'
-            message += ' for deletion: '
-            message += ', '.join(deleted)
-            status = 'done'
-            trans.sa_session.flush()
-        job_lock = trans.app.job_manager.job_lock
         cutoff_time = datetime.utcnow() - timedelta(seconds=int(cutoff))
         jobs = trans.sa_session.query(trans.app.model.Job) \
                                .filter(and_(trans.app.model.Job.table.c.update_time < cutoff_time,
@@ -1582,29 +1553,15 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
         def prepare_jobs_list(jobs):
             res = []
             for job in jobs:
-                delta = datetime.utcnow() - job.update_time
-                update_time = ""
-                if delta.days > 0:
-                    update_time = '%s hours ago' % (delta.days * 24 + int(delta.seconds / 60 / 60))
-                elif delta > timedelta(minutes=59):
-                    update_time = '%s hours ago' % int(delta.seconds / 60 / 60)
-                else:
-                    update_time = '%s minutes ago' % int(delta.seconds / 60)
-                inputs = ""
-                try:
-                    inputs = ", ".join(['{} {}'.format(da.dataset.id, da.dataset.state) for da in job.input_datasets])
-                except Exception:
-                    inputs = 'Unable to determine inputs'
                 res.append({
                     'job_info': {
                         'id': job.id,
-                        'info_url': "{}?jobid={}".format(web.url_for(controller="admin", action="job_info"), job.id)
                     },
+                    'id': trans.security.encode_id(job.id),
                     'user': job.history.user.email if job.history and job.history.user else 'anonymous',
-                    'update_time': update_time,
+                    'update_time': job.update_time.isoformat(),
                     'tool_id': job.tool_id,
                     'state': job.state,
-                    'input_dataset': inputs,
                     'command_line': job.command_line,
                     'job_runner_name': job.job_runner_name,
                     'job_runner_external_id': job.job_runner_external_id
@@ -1614,8 +1571,7 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
                 'recent_jobs': prepare_jobs_list(recent_jobs),
                 'cutoff': cutoff,
                 'message': message,
-                'status': status,
-                'job_lock': job_lock}
+                'status': status}
 
     @web.expose
     @web.require_admin
@@ -1624,8 +1580,7 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
         if jobid is not None:
             job = trans.sa_session.query(trans.app.model.Job).get(jobid)
         return trans.fill_template('/webapps/reports/job_info.mako',
-                                   job=job,
-                                   message="<a href='jobs'>Back</a>")
+                                   job=job)
 
     @web.expose
     @web.require_admin
@@ -1647,7 +1602,7 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
             # install the dependencies for the tools in the selected_tool_ids list
             if not isinstance(selected_tool_ids, list):
                 selected_tool_ids = [selected_tool_ids]
-            requirements = set([tools_by_id[tid].tool_requirements for tid in selected_tool_ids])
+            requirements = {tools_by_id[tid].tool_requirements for tid in selected_tool_ids}
             if install_dependencies:
                 [view.install_dependencies(r) for r in requirements]
             elif uninstall_dependencies:
@@ -1665,19 +1620,19 @@ class AdminGalaxy(controller.JSAppLauncher, AdminActions, UsesQuotaMixin, QuotaP
 
     @web.expose
     @web.require_admin
-    def sanitize_whitelist(self, trans, submit_whitelist=False, tools_to_whitelist=[]):
-        if submit_whitelist:
-            # write the configured sanitize_whitelist_file with new whitelist
+    def sanitize_allowlist(self, trans, submit_allowlist=False, tools_to_allowlist=[]):
+        if submit_allowlist:
+            # write the configured sanitize_allowlist_file with new allowlist
             # and update in-memory list.
-            with open(trans.app.config.sanitize_whitelist_file, 'wt') as f:
-                if isinstance(tools_to_whitelist, six.string_types):
-                    tools_to_whitelist = [tools_to_whitelist]
-                new_whitelist = sorted([tid for tid in tools_to_whitelist if tid in trans.app.toolbox.tools_by_id])
-                f.write("\n".join(new_whitelist))
-            trans.app.config.sanitize_whitelist = new_whitelist
-            trans.app.queue_worker.send_control_task('reload_sanitize_whitelist', noop_self=True)
+            with open(trans.app.config.sanitize_allowlist_file, 'wt') as f:
+                if isinstance(tools_to_allowlist, six.string_types):
+                    tools_to_allowlist = [tools_to_allowlist]
+                new_allowlist = sorted([tid for tid in tools_to_allowlist if tid in trans.app.toolbox.tools_by_id])
+                f.write("\n".join(new_allowlist))
+            trans.app.config.sanitize_allowlist = new_allowlist
+            trans.app.queue_worker.send_control_task('reload_sanitize_allowlist', noop_self=True)
             # dispatch a message to reload list for other processes
-        return trans.fill_template('/webapps/galaxy/admin/sanitize_whitelist.mako',
+        return trans.fill_template('/webapps/galaxy/admin/sanitize_allowlist.mako',
                                    sanitize_all=trans.app.config.sanitize_all_html,
                                    tools=trans.app.toolbox.tools_by_id)
 

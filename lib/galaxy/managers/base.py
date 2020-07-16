@@ -551,7 +551,7 @@ class ModelSerializer(HasAModelManager):
         #   this allows us to: 'mention' the key without adding the default serializer
         # TODO: we may want to eventually error if a key is requested
         #   that is in neither serializable_keyset or serializers
-        self.serializable_keyset = set([])
+        self.serializable_keyset = set()
         # a map of dictionary keys to the functions (often lambdas) that create the values for those keys
         self.serializers = {}
         # add subclass serializers defined there
@@ -659,7 +659,7 @@ class ModelSerializer(HasAModelManager):
             return None
         split = type_id.split(TYPE_ID_SEP, 1)
         # Note: it may not be best to encode the id at this layer
-        return TYPE_ID_SEP.join([split[0], self.app.security.encode_id(split[1])])
+        return TYPE_ID_SEP.join((split[0], self.app.security.encode_id(split[1])))
 
     # serializing to a view where a view is a predefied list of keys to serialize
     def serialize_to_view(self, item, view=None, keys=None, default_view=None, **context):
@@ -719,7 +719,7 @@ class ModelDeserializer(HasAModelManager):
         self.app = app
 
         self.deserializers = {}
-        self.deserializable_keyset = set([])
+        self.deserializable_keyset = set()
         self.add_deserializers()
         # a sub object that can validate incoming values
         self.validate = validator or ModelValidator(self.app)
@@ -914,7 +914,7 @@ class ModelFilterParser(HasAModelManager):
         self.date_string_re = re.compile(r'^(\d{4}\-\d{2}\-\d{2})[T| ]{0,1}(\d{2}:\d{2}:\d{2}(?:\.\d{1,6}){0,1}){0,1}Z{0,1}$')
 
         # dictionary containing parsing data for ORM/SQLAlchemy-based filters
-        # ..note: although kind of a pain in the ass and verbose, opt-in/whitelisting allows more control
+        # ..note: although kind of a pain in the ass and verbose, opt-in/allowlisting allows more control
         #   over potentially expensive queries
         self.orm_filter_parsers = {}
 
@@ -935,8 +935,8 @@ class ModelFilterParser(HasAModelManager):
             'encoded_id'    : {'column' : 'id', 'op': ('in'), 'val': self.parse_id_list},
             # dates can be directly passed through the orm into a filter (no need to parse into datetime object)
             'extension'     : {'op': ('eq', 'like', 'in')},
-            'create_time'   : {'op': ('le', 'ge'), 'val': self.parse_date},
-            'update_time'   : {'op': ('le', 'ge'), 'val': self.parse_date},
+            'create_time'   : {'op': ('le', 'ge', 'lt', 'gt'), 'val': self.parse_date},
+            'update_time'   : {'op': ('le', 'ge', 'lt', 'gt'), 'val': self.parse_date},
         })
 
     def parse_filters(self, filter_tuple_list):
@@ -1013,11 +1013,11 @@ class ModelFilterParser(HasAModelManager):
         # orm_filter_list is a dict: orm_filter_list[ attr ] = <list of allowed ops>
         column_map = self.orm_filter_parsers.get(attr, None)
         if not column_map:
-            # no column mapping (not whitelisted)
+            # no column mapping (not allowlisted)
             return None
         if callable(column_map):
             return self.parsed_filter(filter_type="orm_function", filter=column_map(attr, op, val))
-        # attr must be a whitelisted column by attr name or by key passed in column_map
+        # attr must be an allowlisted column by attr name or by key passed in column_map
         # note: column_map[ 'column' ] takes precedence
         if 'column' in column_map:
             attr = column_map['column']
@@ -1029,7 +1029,7 @@ class ModelFilterParser(HasAModelManager):
             # no orm column
             return None
 
-        # op must be whitelisted: contained in the list orm_filter_list[ attr ][ 'op' ]
+        # op must be allowlisted: contained in the list orm_filter_list[ attr ][ 'op' ]
         allowed_ops = column_map.get('op')
         if op not in allowed_ops:
             return None
@@ -1122,7 +1122,7 @@ class ModelFilterParser(HasAModelManager):
 
         match = self.date_string_re.match(date_string)
         if match:
-            date_string = ' '.join([group for group in match.groups() if group])
+            date_string = ' '.join(group for group in match.groups() if group)
             return date_string
         raise ValueError('datetime strings must be in the ISO 8601 format and in the UTC')
 

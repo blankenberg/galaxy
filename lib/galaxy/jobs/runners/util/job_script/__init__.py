@@ -7,7 +7,10 @@ from string import Template
 
 from pkg_resources import resource_string
 
-from galaxy.util import unicodify
+from galaxy.util import (
+    RWXR_XR_X,
+    unicodify,
+)
 
 log = logging.getLogger(__name__)
 DEFAULT_SHELL = '/bin/bash'
@@ -107,7 +110,7 @@ def check_script_integrity(config):
     return getattr(config, "check_job_script_integrity", DEFAULT_INTEGRITY_CHECK)
 
 
-def write_script(path, contents, config, mode=0o755):
+def write_script(path, contents, config, mode=RWXR_XR_X):
     dir = os.path.dirname(path)
     if not os.path.exists(dir):
         os.makedirs(dir)
@@ -125,7 +128,7 @@ def _handle_script_integrity(path, config):
     script_integrity_verified = False
     count = getattr(config, "check_job_script_integrity_count", DEFAULT_INTEGRITY_COUNT)
     sleep_amt = getattr(config, "check_job_script_integrity_sleep", DEFAULT_INTEGRITY_SLEEP)
-    for i in range(count):
+    for _ in range(count):
         try:
             returncode = subprocess.call([path], env={"ABC_TEST_JOB_SCRIPT_INTEGRITY_XYZ": "1"})
             if returncode == 42:

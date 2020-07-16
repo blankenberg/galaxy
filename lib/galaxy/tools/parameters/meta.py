@@ -105,12 +105,9 @@ def expand_meta_parameters(trans, tool, incoming):
     execution).
     """
 
-    to_remove = []
-    for key in incoming.keys():
+    for key in list(incoming.keys()):
         if key.endswith("|__identifier__"):
-            to_remove.append(key)
-    for key in to_remove:
-        incoming.pop(key)
+            incoming.pop(key)
 
     # If we're going to multiply input dataset combinations
     # order matters, so the following reorders incoming
@@ -205,6 +202,6 @@ def __collection_multirun_parameter(value):
     batch_values = util.listify(value['values'])
     if len(batch_values) == 1:
         batch_over = batch_values[0]
-        if isinstance(batch_over, dict) and ('src' in batch_over) and (batch_over['src'] == 'hdca'):
+        if isinstance(batch_over, dict) and ('src' in batch_over) and (batch_over['src'] in {'hdca', 'dce'}):
             return True
     return False

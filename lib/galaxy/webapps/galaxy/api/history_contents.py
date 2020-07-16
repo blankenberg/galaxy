@@ -181,7 +181,7 @@ class HistoryContentsController(BaseAPIController, UsesLibraryMixin, UsesLibrary
     def index_jobs_summary(self, trans, history_id, **kwd):
         """
         * GET /api/histories/{history_id}/jobs_summary
-            return detailed information about an HDA or HDCAs jobs
+            return job state summary info for jobs, implicit groups jobs for collections or workflow invocations
 
         Warning: We allow anyone to fetch job state information about any object they
         can guess an encoded ID for - it isn't considered protected data. This keeps
@@ -189,13 +189,13 @@ class HistoryContentsController(BaseAPIController, UsesLibraryMixin, UsesLibrary
         efficient as possible.
 
         :type   history_id: str
-        :param  history_id: encoded id string of the HDA's or the HDCA's History
+        :param  history_id: encoded id string of the target history
         :type   ids:        str[]
         :param  ids:        the encoded ids of job summary objects to return - if ids
                             is specified types must also be specified and have same length.
         :type   types:      str[]
-        :param  types:      type of object represented by elements in the ids array - either
-                            Job or ImplicitCollectionJob.
+        :param  types:      type of object represented by elements in the ids array - any of
+                            Job, ImplicitCollectionJob, or WorkflowInvocation.
 
         :rtype:     dict[]
         :returns:   an array of job summary object dictionaries.
@@ -207,9 +207,9 @@ class HistoryContentsController(BaseAPIController, UsesLibraryMixin, UsesLibrary
             # TODO: ...
             pass
         else:
-            ids = util.listify(ids)
+            ids = [self.app.security.decode_id(i) for i in util.listify(ids)]
             types = util.listify(types)
-        return [self.encode_all_ids(trans, s) for s in fetch_job_states(self.app, trans.sa_session, ids, types)]
+        return [self.encode_all_ids(trans, s) for s in fetch_job_states(trans.sa_session, ids, types)]
 
     @expose_api_anonymous
     def show_jobs_summary(self, trans, id, history_id, **kwd):
@@ -522,6 +522,7 @@ class HistoryContentsController(BaseAPIController, UsesLibraryMixin, UsesLibrary
             dataset_collection_instance = service.create(
                 trans,
                 parent=history,
+                history=history,
                 **create_params
             )
         elif source == "hdca":
@@ -903,7 +904,12 @@ class HistoryContentsController(BaseAPIController, UsesLibraryMixin, UsesLibrary
         view = serialization_params.pop('view')
 
         contents = self.history_contents_manager.contents(history,
-            filters=filters, limit=limit, offset=offset, order_by=order_by)
+            filters=filters,
+            limit=limit,
+            offset=offset,
+            order_by=order_by,
+            serialization_params=serialization_params)
+
         for content in contents:
 
             # TODO: remove split
@@ -926,7 +932,7 @@ class HistoryContentsController(BaseAPIController, UsesLibraryMixin, UsesLibrary
     def encode_type_id(self, type_id):
         TYPE_ID_SEP = '-'
         split = type_id.split(TYPE_ID_SEP, 1)
-        return TYPE_ID_SEP.join([split[0], self.app.security.encode_id(split[1])])
+        return TYPE_ID_SEP.join((split[0], self.app.security.encode_id(split[1])))
 
     @expose_api_raw
     def archive(self, trans, history_id, filename='', format='tgz', dry_run=True, **kwd):
@@ -1040,7 +1046,7 @@ class HistoryContentsController(BaseAPIController, UsesLibraryMixin, UsesLibrary
         for file_path, archive_path in paths_and_files:
             archive.add(file_path, archive_path)
 
-        archive_name = '.'.join([archive_base_name, archive_ext])
+        archive_name = '.'.join((archive_base_name, archive_ext))
         trans.response.set_content_type("application/x-tar")
         trans.response.headers["Content-Disposition"] = 'attachment; filename="{}"'.format(archive_name)
         archive.wsgi_status = trans.response.wsgi_status()

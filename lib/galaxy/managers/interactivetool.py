@@ -139,7 +139,7 @@ class InteractiveToolManager(object):
         self.security = app.security
         self.sa_session = app.model.context
         self.job_manager = app.job_manager
-        self.propagator = InteractiveToolSqlite(app.config.interactivetool_map, app.security.encode_id)
+        self.propagator = InteractiveToolSqlite(app.config.interactivetools_map, app.security.encode_id)
 
     def create_entry_points(self, job, tool, entry_points=None, flush=True):
         entry_points = entry_points or tool.ports
@@ -259,17 +259,19 @@ class InteractiveToolManager(object):
 
     def target_if_active(self, trans, entry_point):
         if entry_point.active and not entry_point.deleted:
-            request_host = trans.request.host
+            entry_point_encoded_id = trans.security.encode_id(entry_point.id)
+            entry_point_class = entry_point.__class__.__name__.lower()
+            entry_point_prefix = self.app.config.interactivetools_prefix
             if entry_point.requires_domain:
-                rval = '%s//%s-%s.%s.%s.%s/' % (trans.request.host_url.split('//', 1)[0],
-                    trans.security.encode_id(entry_point.id),
-                    entry_point.token,
-                    entry_point.__class__.__name__.lower(),
-                    self.app.config.interactivetool_prefix, request_host)
+                request_host = trans.request.host
+                protocol = trans.request.host_url.split('//', 1)[0]
+                interactivetools_proxy_host = self.app.config.interactivetools_proxy_host or request_host
+                rval = '%s//%s-%s.%s.%s.%s/' % (protocol, entry_point_encoded_id,
+                        entry_point.token, entry_point_class, entry_point_prefix, interactivetools_proxy_host)
             else:
-                rval = self.app.url_for('%s/access/%s/%s/%s/' % (trans.app.config.interactivetool_prefix,
-                    entry_point.__class__.__name__.lower(),
-                    trans.security.encode_id(entry_point.id),
+                rval = self.app.url_for('%s/access/%s/%s/%s/' % (entry_point_prefix,
+                    entry_point_class,
+                    entry_point_encoded_id,
                     entry_point.token))
             if entry_point.entry_url:
                 rval = '%s/%s' % (rval.rstrip('/'), entry_point.entry_url.lstrip('/'))
@@ -279,7 +281,7 @@ class InteractiveToolManager(object):
         entry_point = trans.sa_session.query(model.InteractiveToolEntryPoint).get(entry_point_id)
         if self.app.interactivetool_manager.can_access_entry_point(trans, entry_point):
             if entry_point.active:
-                return self.target_if_active(entry_point)
+                return self.target_if_active(trans, entry_point)
             elif entry_point.deleted:
                 raise exceptions.MessageException('InteractiveTool has ended. You will have to start a new one.')
             else:

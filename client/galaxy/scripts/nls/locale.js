@@ -220,7 +220,7 @@ define({
         "Reload a tool's configuration": false,
         "Review tool migration stages": false,
         "View Tool Error Logs": false,
-        "Manage Display Whitelist": false,
+        "Manage Allowlist": false,
         "Manage Tool Dependencies": false,
         Users: false,
         Groups: false,
@@ -339,9 +339,6 @@ define({
         "Delete this repeat block": false,
         placeholder: false,
         Repeat: false,
-        // ---------------------------------------------------------------------------- ui-select-genomespace
-        "Browse GenomeSpace": false,
-        Browse: false,
         // ---------------------------------------------------------------------------- ui-frames
         Error: false,
         Close: false,
@@ -376,7 +373,7 @@ define({
         "View migration stages": false,
         "View lineage": false,
         "Manage dependencies": false,
-        "Manage whitelist": false,
+        "Manage allowlist": false,
         "Manage metadata": false,
         "Manage tools": false,
         "Monitor installation": false,
@@ -457,10 +454,10 @@ define({
         // ---------------------------------------------------------------------------- upload-button
         "Download from URL or upload files from disk": false,
         // ---------------------------------------------------------------------------- workflow_editor_tests
-        "tool tooltip": false
+        "tool tooltip": false,
         // ----------------------------------------------------------------------------
     },
     ja: true,
     fr: true,
-    zh: true
+    zh: true,
 });

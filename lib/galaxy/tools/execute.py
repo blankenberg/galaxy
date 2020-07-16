@@ -13,11 +13,11 @@ from galaxy import model
 from galaxy.model.dataset_collections.structure import get_structure, tool_output_to_structure
 from galaxy.tool_util.parser import ToolOutputCollectionPart
 from galaxy.tools.actions import filter_output, on_text_for_names, ToolExecutionCache
-from galaxy.util import ExecutionTimer
 
 log = logging.getLogger(__name__)
 
-EXECUTION_SUCCESS_MESSAGE = "Tool [%s] created job [%s] %s"
+SINGLE_EXECUTION_SUCCESS_MESSAGE = "Tool ${tool_id} created job ${job_id}"
+BATCH_EXECUTION_MESSAGE = "Executed ${job_count} job(s) for tool ${tool_id} request"
 
 
 class PartialJobExecution(Exception):
@@ -39,7 +39,10 @@ def execute(trans, tool, mapping_params, history, rerun_remap_job_id=None, colle
     if rerun_remap_job_id:
         assert invocation_step is None
 
-    all_jobs_timer = ExecutionTimer()
+    all_jobs_timer = tool.app.execution_timer_factory.get_timer(
+        'internals.galaxy.tools.execute.job_batch', BATCH_EXECUTION_MESSAGE
+    )
+
     if invocation_step is None:
         execution_tracker = ToolExecutionTracker(trans, tool, mapping_params, collection_info)
     else:
@@ -47,7 +50,9 @@ def execute(trans, tool, mapping_params, history, rerun_remap_job_id=None, colle
     execution_cache = ToolExecutionCache(trans)
 
     def execute_single_job(execution_slice, completed_job):
-        job_timer = ExecutionTimer()
+        job_timer = tool.app.execution_timer_factory.get_timer(
+            'internals.galaxy.tools.execute.job_single', SINGLE_EXECUTION_SUCCESS_MESSAGE
+        )
         params = execution_slice.param_combination
         if workflow_invocation_uuid:
             params['__workflow_invocation_uuid__'] = workflow_invocation_uuid
@@ -63,10 +68,9 @@ def execute(trans, tool, mapping_params, history, rerun_remap_job_id=None, colle
             del params['__workflow_resource_params__']
         if validate_outputs:
             params['__validate_outputs__'] = True
-        job, result = tool.handle_single_execution(trans, rerun_remap_job_id, execution_slice, history, execution_cache, completed_job, collection_info)
+        job, result = tool.handle_single_execution(trans, rerun_remap_job_id, execution_slice, history, execution_cache, completed_job, collection_info, flush_job=False)
         if job:
-            message = EXECUTION_SUCCESS_MESSAGE % (tool.id, job.id, job_timer)
-            log.debug(message)
+            log.debug(job_timer.to_str(tool_id=tool.id, job_id=job.id))
             execution_tracker.record_success(execution_slice, job, result)
         else:
             execution_tracker.record_error(result)
@@ -89,6 +93,7 @@ def execute(trans, tool, mapping_params, history, rerun_remap_job_id=None, colle
 
     jobs_executed = 0
     has_remaining_jobs = False
+    datasets_to_persist = []
 
     for i, execution_slice in enumerate(execution_tracker.new_execution_slices()):
         if max_num_jobs and jobs_executed >= max_num_jobs:
@@ -96,13 +101,26 @@ def execute(trans, tool, mapping_params, history, rerun_remap_job_id=None, colle
             break
         else:
             execute_single_job(execution_slice, completed_jobs[i])
+            if execution_slice.datasets_to_persist:
+                datasets_to_persist.extend(execution_slice.datasets_to_persist)
+
+    if datasets_to_persist:
+        execution_slice.history.add_datasets(trans.sa_session, datasets_to_persist, set_hid=True, quota=False, flush=False)
+        # a side effect of history.add_datasets is a commit within db_next_hid (even with flush=False).
+    else:
+        # Make sure collections, implicit jobs etc are flushed even if there are no precreated output datasets
+        trans.sa_session.flush()
+    for job in execution_tracker.successful_jobs:
+        # Put the job in the queue if tracking in memory
+        tool.app.job_manager.enqueue(job, tool=tool)
+        trans.log_event("Added job to the job queue, id: %s" % str(job.id), tool_id=job.tool_id)
 
     if has_remaining_jobs:
         raise PartialJobExecution(execution_tracker)
     else:
         execution_tracker.finalize_dataset_collections(trans)
 
-    log.debug("Executed %d job(s) for tool %s request: %s" % (job_count, tool.id, all_jobs_timer))
+    log.debug(all_jobs_timer.to_str(job_count=job_count, tool_id=tool.id))
     return execution_tracker
 
 
@@ -112,6 +130,8 @@ class ExecutionSlice(object):
         self.job_index = job_index
         self.param_combination = param_combination
         self.dataset_collection_elements = dataset_collection_elements
+        self.datasets_to_persist = None
+        self.history = None
 
 
 class ExecutionTracker(object):
@@ -357,7 +377,7 @@ class ExecutionTracker(object):
             job_assoc = model.ImplicitCollectionJobsJobAssociation()
             job_assoc.order_index = execution_slice.job_index
             job_assoc.implicit_collection_jobs = implicit_collection_jobs
-            job_assoc.job_id = job.id
+            job_assoc.job = job
             self.trans.sa_session.add(job_assoc)
 
 

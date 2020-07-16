@@ -42,7 +42,7 @@ DEFAULT_CONDARC_OVERRIDE = "_condarc"
 # https://github.com/bioconda/bioconda-recipes/blob/master/config.yml , but
 # adding `iuc` as first channel (for Galaxy-specific packages)
 DEFAULT_ENSURE_CHANNELS = "iuc,conda-forge,bioconda,defaults"
-CONDA_SOURCE_CMD = """[ "$(basename "$CONDA_DEFAULT_ENV")" = "$(basename '{environment_path}')" ] ||
+CONDA_SOURCE_CMD = """[ "$(basename "$CONDA_DEFAULT_ENV")" = "$(basename '{environment_path}')" ] || {{
 MAX_TRIES=3
 COUNT=0
 while [ $COUNT -lt $MAX_TRIES ]; do
@@ -58,14 +58,15 @@ while [ $COUNT -lt $MAX_TRIES ]; do
         fi
         sleep 10s
     fi
-done """
+done
+}} """
 
 
 log = logging.getLogger(__name__)
 
 
 class CondaDependencyResolver(DependencyResolver, MultipleDependencyResolver, ListableDependencyResolver, InstallableDependencyResolver, SpecificationPatternDependencyResolver, MappableDependencyResolver):
-    dict_collection_visible_keys = DependencyResolver.dict_collection_visible_keys + ['conda_prefix', 'versionless', 'ensure_channels', 'auto_install', 'auto_init', 'use_local']
+    dict_collection_visible_keys = DependencyResolver.dict_collection_visible_keys + ['prefix', 'versionless', 'ensure_channels', 'auto_install', 'auto_init', 'use_local']
     resolver_type = "conda"
     config_options = {
         'prefix': None,
@@ -151,7 +152,7 @@ class CondaDependencyResolver(DependencyResolver, MultipleDependencyResolver, Li
             all_resolved = [r for r in all_resolved if r.dependency_type]
         if not all_resolved:
             return None
-        environments = set([os.path.basename(dependency.environment_path) for dependency in all_resolved])
+        environments = {os.path.basename(dependency.environment_path) for dependency in all_resolved}
         return self.uninstall_environments(environments)
 
     def uninstall_environments(self, environments):
@@ -239,6 +240,7 @@ class CondaDependencyResolver(DependencyResolver, MultipleDependencyResolver, Li
                     name=requirement.name,
                     version=requirement.version,
                     preserve_python_environment=preserve_python_environment,
+                    dependency_resolver=self,
                 )
                 dependencies.append(dependency)
 
@@ -372,10 +374,10 @@ class CondaDependencyResolver(DependencyResolver, MultipleDependencyResolver, Li
 
 
 class MergedCondaDependency(Dependency):
-    dict_collection_visible_keys = Dependency.dict_collection_visible_keys + ['environment_path', 'name', 'version']
+    dict_collection_visible_keys = Dependency.dict_collection_visible_keys + ['environment_path', 'name', 'version', 'dependency_resolver']
     dependency_type = 'conda'
 
-    def __init__(self, conda_context, environment_path, exact, name=None, version=None, preserve_python_environment=False):
+    def __init__(self, conda_context, environment_path, exact, name=None, version=None, preserve_python_environment=False, dependency_resolver=None):
         self.activate = conda_context.activate
         self.conda_context = conda_context
         self.environment_path = environment_path
@@ -384,6 +386,7 @@ class MergedCondaDependency(Dependency):
         self._version = version
         self.cache_path = None
         self._preserve_python_environment = preserve_python_environment
+        self.dependency_resolver = dependency_resolver
 
     @property
     def exact(self):
@@ -413,11 +416,11 @@ class MergedCondaDependency(Dependency):
 
 
 class CondaDependency(Dependency):
-    dict_collection_visible_keys = Dependency.dict_collection_visible_keys + ['environment_path', 'name', 'version']
+    dict_collection_visible_keys = Dependency.dict_collection_visible_keys + ['environment_path', 'name', 'version', 'dependency_resolver']
     dependency_type = 'conda'
     cacheable = True
 
-    def __init__(self, conda_context, environment_path, exact, name=None, version=None, preserve_python_environment=False):
+    def __init__(self, conda_context, environment_path, exact, name=None, version=None, preserve_python_environment=False, dependency_resolver=None):
         self.activate = conda_context.activate
         self.conda_context = conda_context
         self.environment_path = environment_path
@@ -426,6 +429,7 @@ class CondaDependency(Dependency):
         self._version = version
         self.cache_path = None
         self._preserve_python_environment = preserve_python_environment
+        self.dependency_resolver = dependency_resolver
 
     @property
     def exact(self):
