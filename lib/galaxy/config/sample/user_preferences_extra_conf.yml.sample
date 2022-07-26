@@ -94,3 +94,17 @@ preferences:
               label: Password
               type:  password
               required: False
+
+    # Used in Qiskit interactive tool
+    ibmq_account:
+        description: IBMQ account information
+        inputs:
+            - name: token
+              label: IBMQ token (see https://quantum-computing.ibm.com/account)
+              type: password
+              required: False
+            - name: url
+              label: IBMQ URL (https://auth.quantum-computing.ibm.com/api)
+              type: text
+              required: False
+              value: https://auth.quantum-computing.ibm.com/api
