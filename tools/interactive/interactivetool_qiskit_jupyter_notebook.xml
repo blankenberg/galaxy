@@ -1,7 +1,7 @@
-<tool id="interactive_tool_qiskit_jupyter_notebook" tool_type="interactive" name="Qiskit Jupyter notebook" version="0.0.1" profile="22.01">
+<tool id="interactive_tool_qiskit_jupyter_notebook" tool_type="interactive" name="Qiskit Jupyter notebook" version="0.0.2" profile="22.01">
     <description>interactive tool</description>
     <requirements>
-        <container type="docker">docker.io/blankenberg/docker-ml-qiskit-jupyterlab:galaxy-integration-0.0.1</container>
+        <container type="docker">docker.io/blankenberg/docker-ml-qiskit-jupyterlab:galaxy-integration-0.0.2</container>
     </requirements>
     <entry_points>
         <entry_point name="Qiskit Jupyter Notebook" requires_domain="True">
@@ -66,10 +66,32 @@ with open(os.path.join(data_staging_path, galaxy_inputs), "w") as fh:
         </configfile>
         <configfile name="galaxy_input_startup_script"><![CDATA[
 import json, os
+import shutil
+
+import galaxy_ie_helpers
+
 from galaxy_ie_helpers import get
 from galaxy_ie_helpers import put
 from galaxy_ie_helpers import get_galaxy_connection
-HISTORY_ID = os.environ.get('HISTORY_ID', None)
+
+from bioblend.galaxy.histories import HistoryClient
+
+hid = os.environ.get('DATASET_HID', None)
+HISTORY_ID = history_id = os.environ['HISTORY_ID']
+if hid not in ('None', None):
+    galaxy_ie_helpers.get(int(hid))
+    shutil.copy('/import/%s' % hid, '/import/ipython_galaxy_notebook.ipynb')
+
+additional_ids = os.environ.get("ADDITIONAL_IDS", "")
+if additional_ids:
+    gi = galaxy_ie_helpers.get_galaxy_connection(history_id=history_id, obj=False)
+    hc = HistoryClient(gi)
+    history = hc.show_history(history_id, contents=True)
+    additional_ids = additional_ids.split(",")
+    for hda in history:
+        if hda["id"] in additional_ids:
+            galaxy_ie_helpers.get(int(hda["hid"]))
+
 try:
     GALAXY_INPUTS = json.load(open(os.path.join(os.environ.get("GALAXY_WORKING_DIR", ""), "jupyter", "galaxy_inputs", "galaxy_inputs.json")))
 except FileNotFoundError:
@@ -97,13 +119,19 @@ verify = True
         cp '${galaxy_input_startup_script}' /home/jovyan/.ipython/profile_default/startup/01-load.py &&
 
         mkdir -p /home/jovyan/.qiskit && cp '${qiskitrc}' /home/jovyan/.qiskit/qiskitrc &&
+        mkdir -p resources &&
+        ln -s /home/jovyan/qiskit resources/ &&
+        ln -s /home/jovyan/data resources/ &&
+        ln -s /home/jovyan/elyra resources/ &&
+        ln -s /home/jovyan/home_page.ipynb resources/ &&
+        ln -s /home/jovyan/notebooks resources/ &&
 
-        #set $output_notebook_name = 'ipython_galaxy_notebook.ipynb'
+        #set $output_notebook_name = 'qiskit_galaxy_notebook.ipynb'
         #if $mode.mode_select == 'scratch':
             ## copy default notebook
             cp '$__tool_directory__/default_notebook.ipynb' ${output_notebook_name} &&
             jupyter trust ${output_notebook_name} &&
-            jupyter lab --allow-root --no-browser --NotebookApp.shutdown_button=True &&
+            jupyter lab --allow-root --no-browser --ServerApp.quit_button=True &&
         #else:
             #import re
             #set $cleaned_name = re.sub('[^\w\-\.]', '_', str($mode.ipynb.element_identifier))
@@ -117,7 +145,7 @@ verify = True
                 jupyter nbconvert --to notebook --execute --output '${output_notebook_name}' --allow-errors '${cleaned_name}' &&
             #else:
                 #set $output_notebook_name = $cleaned_name
-                jupyter lab --allow-root --no-browser --NotebookApp.shutdown_button=True &&
+                jupyter lab --allow-root --no-browser --ServerApp.quit_button=True &&
             #end if
         #end if
         cp '${output_notebook_name}' '$jupyter_notebook'
