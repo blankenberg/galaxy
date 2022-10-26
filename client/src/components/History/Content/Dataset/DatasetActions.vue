@@ -2,7 +2,14 @@
     <div class="dataset-actions mb-1">
         <div class="clearfix">
             <div class="btn-group float-left">
-                <b-button v-if="showError" class="px-1" title="Error" size="sm" variant="link" @click.stop="onError">
+                <b-button
+                    v-if="showError"
+                    class="px-1"
+                    title="Error"
+                    size="sm"
+                    variant="link"
+                    :href="reportErrorUrl"
+                    @click.prevent.stop="onError">
                     <span class="fa fa-bug" />
                 </b-button>
                 <dataset-download v-if="showDownloads" :item="item" @on-download="onDownload" />
@@ -21,16 +28,18 @@
                     title="Dataset Details"
                     size="sm"
                     variant="link"
-                    @click.stop="onInfo">
+                    :href="showDetailsUrl"
+                    @click.prevent.stop="onInfo">
                     <span class="fa fa-info-circle" />
                 </b-button>
                 <b-button
-                    v-if="showRerun"
+                    v-if="writable && showRerun"
                     class="rerun-btn px-1"
                     title="Run Job Again"
                     size="sm"
                     variant="link"
-                    @click.stop="onRerun">
+                    :href="rerunUrl"
+                    @click.prevent.stop="onRerun">
                     <span class="fa fa-redo" />
                 </b-button>
                 <b-button
@@ -39,7 +48,8 @@
                     title="Visualize"
                     size="sm"
                     variant="link"
-                    @click.stop="onVisualize">
+                    :href="visualizeUrl"
+                    @click.prevent.stop="onVisualize">
                     <span class="fa fa-bar-chart-o" />
                 </b-button>
                 <b-button
@@ -60,9 +70,8 @@
 </template>
 
 <script>
-import { iframeAdd } from "components/plugins/legacyNavigation";
 import { copy as sendToClipboard } from "utils/clipboard";
-import { absPath } from "utils/redirect";
+import { absPath, prependPath } from "utils/redirect.js";
 import { downloadUrlMixin } from "./mixins.js";
 import DatasetDownload from "./DatasetDownload";
 
@@ -73,7 +82,9 @@ export default {
     mixins: [downloadUrlMixin],
     props: {
         item: { type: Object, required: true },
+        writable: { type: Boolean, default: true },
         showHighlight: { type: Boolean, default: false },
+        itemUrls: { type: Object, required: true },
     },
     computed: {
         showDownloads() {
@@ -97,6 +108,18 @@ export default {
             // TODO: Check hasViz, if visualizations are activated in the config
             return !this.item.purged && ["ok", "failed_metadata", "error"].includes(this.item.state);
         },
+        reportErrorUrl() {
+            return prependPath(this.itemUrls.reportError);
+        },
+        showDetailsUrl() {
+            return prependPath(this.itemUrls.showDetails);
+        },
+        rerunUrl() {
+            return prependPath(this.itemUrls.rerun);
+        },
+        visualizeUrl() {
+            return prependPath(this.itemUrls.visualize);
+        },
     },
     methods: {
         onCopyLink() {
@@ -107,21 +130,17 @@ export default {
             window.location.href = resource;
         },
         onError() {
-            this.$router.push(`/datasets/${this.item.id}/error`);
+            this.$router.push(this.itemUrls.reportError);
         },
         onInfo() {
-            this.$router.push(`/datasets/${this.item.id}/details`);
+            this.$router.push(this.itemUrls.showDetails);
         },
         onRerun() {
-            this.$router.push(`/root?job_id=${this.item.creating_job}`);
+            this.$router.push(`/root?job_id=${this.item.creating_job}`, { force: true });
         },
         onVisualize() {
-            const name = this.item.name || "...";
-            iframeAdd({
-                title: `Visualization of ${name}`,
-                path: `/visualizations?dataset_id=${this.item.id}`,
-                $router: this.$router,
-            });
+            const title = `Visualization of ${this.item.name || ""}`;
+            this.$router.push(this.itemUrls.visualize, { title });
         },
         onHighlight() {
             this.$emit("toggleHighlights");

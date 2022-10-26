@@ -17,10 +17,7 @@ import random
 import string
 from collections import defaultdict
 from collections.abc import Callable
-from datetime import (
-    datetime,
-    timedelta,
-)
+from datetime import timedelta
 from enum import Enum
 from string import Template
 from typing import (
@@ -123,6 +120,7 @@ from galaxy.model.item_attrs import (
 from galaxy.model.orm.now import now
 from galaxy.model.orm.util import add_object_to_object_session
 from galaxy.model.view import HistoryDatasetCollectionJobStateSummary
+from galaxy.objectstore import ObjectStore
 from galaxy.security import get_permitted_actions
 from galaxy.security.idencoding import IdEncodingHelper
 from galaxy.security.validate_user_input import validate_password_str
@@ -148,7 +146,7 @@ from galaxy.util.form_builder import (
     WorkflowField,
     WorkflowMappingField,
 )
-from galaxy.util.hash_util import new_secure_hash
+from galaxy.util.hash_util import new_insecure_hash
 from galaxy.util.json import safe_loads
 from galaxy.util.sanitize_html import sanitize_html
 
@@ -176,6 +174,8 @@ YIELD_PER_ROWS = 100
 
 if TYPE_CHECKING:
     from galaxy.datatypes.data import Data
+    from galaxy.tools import DefaultToolState
+    from galaxy.workflow.modules import WorkflowModule
 
     class _HasTable:
         table: Table
@@ -640,8 +640,8 @@ class User(Base, Dictifiable, RepresentById):
         if User.use_pbkdf2:
             self.password = galaxy.security.passwords.hash_password(cleartext)
         else:
-            self.password = new_secure_hash(text_type=cleartext)
-        self.last_password_change = datetime.now()
+            self.password = new_insecure_hash(text_type=cleartext)
+        self.last_password_change = now()
 
     def set_random_password(self, length=16):
         """
@@ -2595,6 +2595,10 @@ class History(Base, HasTags, Dictifiable, UsesAnnotations, HasName, Serializable
     def empty(self):
         return self.hid_counter is None or self.hid_counter == 1
 
+    @property
+    def count(self):
+        return self.hid_counter - 1
+
     def add_pending_items(self, set_output_hid=True):
         # These are assumed to be either copies of existing datasets or new, empty datasets,
         # so we don't need to set the quota.
@@ -3452,7 +3456,7 @@ class Dataset(Base, StorableObject, Serializable, _HasTable):
 
     permitted_actions = get_permitted_actions(filter="DATASET")
     file_path = "/tmp/"
-    object_store = None  # This get initialized in mapping.py (method init) by app.py
+    object_store: Optional[ObjectStore] = None  # This get initialized in mapping.py (method init) by app.py
     engine = None
 
     def __init__(
@@ -3568,18 +3572,21 @@ class Dataset(Base, StorableObject, Serializable, _HasTable):
         else:
             return self.object_store.size(self)
 
-    def get_size(self, nice_size=False):
+    def get_size(self, nice_size=False, calculate_size=True):
         """Returns the size of the data on disk"""
         if self.file_size:
             if nice_size:
                 return galaxy.util.nice_size(self.file_size)
             else:
                 return self.file_size
-        else:
+        elif calculate_size:
+            # Hopefully we only reach this branch in sessionless mode
             if nice_size:
                 return galaxy.util.nice_size(self._calculate_size())
             else:
                 return self._calculate_size()
+        else:
+            return self.file_size or 0
 
     def set_size(self, no_extra_files=False):
         """Sets the size of the data on disk.
@@ -3809,8 +3816,10 @@ class DatasetInstance(UsesCreateAndUpdateTime, _HasTable):
     """A base class for all 'dataset instances', HDAs, LDAs, etc"""
 
     states = Dataset.states
+    _state: str
     conversion_messages = Dataset.conversion_messages
     permitted_actions = Dataset.permitted_actions
+    purged: bool
 
     class validated_states(str, Enum):
         UNKNOWN = "unknown"
@@ -4018,11 +4027,11 @@ class DatasetInstance(UsesCreateAndUpdateTime, _HasTable):
         self.clear_associated_files()
         _get_datatypes_registry().change_datatype(self, new_ext)
 
-    def get_size(self, nice_size=False):
+    def get_size(self, nice_size=False, calculate_size=True):
         """Returns the size of the data on disk"""
         if nice_size:
-            return galaxy.util.nice_size(self.dataset.get_size())
-        return self.dataset.get_size()
+            return galaxy.util.nice_size(self.dataset.get_size(calculate_size=calculate_size))
+        return self.dataset.get_size(calculate_size=calculate_size)
 
     def set_size(self, **kwds):
         """Sets and gets the size of the data on disk"""
@@ -4055,10 +4064,6 @@ class DatasetInstance(UsesCreateAndUpdateTime, _HasTable):
     @property
     def hashes(self):
         return self.dataset.hashes
-
-    def get_raw_data(self):
-        """Returns the full data. To stream it open the file_name and read/write as needed"""
-        return self.datatype.get_raw_data(self)
 
     def get_mime(self):
         """Returns the mime type of the data"""
@@ -6601,7 +6606,7 @@ class GalaxySession(Base, RepresentById):
     def __init__(self, is_valid=False, **kwd):
         super().__init__(**kwd)
         self.is_valid = is_valid
-        self.last_action = self.last_action or datetime.now()
+        self.last_action = self.last_action or now()
 
     def add_history(self, history, association=None):
         if association is None:
@@ -6822,7 +6827,7 @@ class Workflow(Base, Dictifiable, RepresentById):
     source_metadata = Column(JSONType)
     uuid = Column(UUIDType, nullable=True)
 
-    steps = relationship(
+    steps: List["WorkflowStep"] = relationship(
         "WorkflowStep",
         back_populates="workflow",
         primaryjoin=(lambda: Workflow.id == WorkflowStep.workflow_id),  # type: ignore[has-type]
@@ -6873,7 +6878,7 @@ class Workflow(Base, Dictifiable, RepresentById):
             steps[step_id] = step
         return steps
 
-    def step_by_index(self, order_index):
+    def step_by_index(self, order_index: int):
         for step in self.steps:
             if order_index == step.order_index:
                 return step
@@ -6984,19 +6989,19 @@ class WorkflowStep(Base, RepresentById):
     workflow_id = Column(Integer, ForeignKey("workflow.id"), index=True, nullable=False)
     subworkflow_id = Column(Integer, ForeignKey("workflow.id"), index=True, nullable=True)
     dynamic_tool_id = Column(Integer, ForeignKey("dynamic_tool.id"), index=True, nullable=True)
-    type = Column(String(64))
+    type: str = Column(String(64))
     tool_id = Column(TEXT)
     tool_version = Column(TEXT)
     tool_inputs = Column(JSONType)
     tool_errors = Column(JSONType)
     position = Column(MutableJSONType)
     config = Column(JSONType)
-    order_index = Column(Integer)
+    order_index: int = Column(Integer)
     uuid = Column(UUIDType)
     label = Column(Unicode(255))
     temp_input_connections: Optional[InputConnDictType]
 
-    subworkflow = relationship(
+    subworkflow: Optional[Workflow] = relationship(
         "Workflow",
         primaryjoin=(lambda: Workflow.id == WorkflowStep.subworkflow_id),
         back_populates="parent_workflow_steps",
@@ -7020,6 +7025,12 @@ class WorkflowStep(Base, RepresentById):
         "Workflow", primaryjoin=(lambda: Workflow.id == WorkflowStep.workflow_id), back_populates="steps"
     )
 
+    # Injected attributes
+    # TODO: code using these should be refactored to not depend on these non-persistent fields
+    module: Optional["WorkflowModule"]
+    state: Optional["DefaultToolState"]
+    upgrade_messages: Optional[Dict]
+
     STEP_TYPE_TO_INPUT_TYPE = {
         "data_input": "dataset",
         "data_collection_input": "dataset_collection",
@@ -7029,6 +7040,10 @@ class WorkflowStep(Base, RepresentById):
 
     def __init__(self):
         self.uuid = uuid4()
+        self._input_connections_by_name = None
+
+    @reconstructor
+    def init_on_load(self):
         self._input_connections_by_name = None
 
     @property
@@ -7044,12 +7059,16 @@ class WorkflowStep(Base, RepresentById):
 
     @property
     def input_default_value(self):
-        tool_inputs = self.tool_inputs
-        tool_state = tool_inputs
+        tool_state = self.tool_inputs
         default_value = tool_state.get("default")
         if default_value:
             default_value = json.loads(default_value)["value"]
         return default_value
+
+    @property
+    def input_optional(self):
+        tool_state = self.tool_inputs
+        return tool_state.get("optional") or False
 
     def get_input(self, input_name):
         for step_input in self.inputs:
@@ -7193,7 +7212,9 @@ class WorkflowStep(Base, RepresentById):
         copied_step.workflow_outputs = copy_list(self.workflow_outputs, copied_step)
 
     def log_str(self):
-        return "WorkflowStep[index=%d,type=%s]" % (self.order_index, self.type)
+        return (
+            f"WorkflowStep[index={self.order_index},type={self.type},label={self.label},uuid={self.uuid},id={self.id}]"
+        )
 
     def clear_module_extras(self):
         # the module code adds random dynamic state to the step, this
@@ -7408,7 +7429,7 @@ class WorkflowInvocation(Base, UsesCreateAndUpdateTime, Dictifiable, Serializabl
         uselist=True,
     )
     steps = relationship("WorkflowInvocationStep", back_populates="workflow_invocation")
-    workflow = relationship("Workflow")
+    workflow: Workflow = relationship("Workflow")
     output_dataset_collections = relationship(
         "WorkflowInvocationOutputDatasetCollectionAssociation", back_populates="workflow_invocation"
     )
@@ -8800,8 +8821,8 @@ class CloudAuthz(Base, _HasTable):
         self.provider = provider
         self.config = config
         self.authn_id = authn_id
-        self.last_update = datetime.now()
-        self.last_activity = datetime.now()
+        self.last_update = now()
+        self.last_activity = now()
         self.description = description
 
     def equals(self, user_id, provider, authn_id, config):
@@ -9512,6 +9533,7 @@ class APIKeys(Base, RepresentById):
     user_id = Column(Integer, ForeignKey("galaxy_user.id"), index=True)
     key = Column(TrimmedString(32), index=True, unique=True)
     user = relationship("User", back_populates="api_keys")
+    deleted = Column(Boolean, index=True, default=False)
 
 
 def copy_list(lst, *args, **kwds):

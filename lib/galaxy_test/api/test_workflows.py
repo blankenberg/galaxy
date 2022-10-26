@@ -16,9 +16,11 @@ from typing import (
 from uuid import uuid4
 
 import pytest
+import yaml
 from requests import (
     delete,
     get,
+    post,
     put,
 )
 
@@ -41,6 +43,7 @@ from galaxy_test.base.workflow_fixtures import (
     WORKFLOW_ONE_STEP_DEFAULT,
     WORKFLOW_OPTIONAL_FALSE_INPUT_COLLECTION,
     WORKFLOW_OPTIONAL_FALSE_INPUT_DATA,
+    WORKFLOW_OPTIONAL_INPUT_DELAYED_SCHEDULING,
     WORKFLOW_OPTIONAL_TRUE_INPUT_COLLECTION,
     WORKFLOW_OPTIONAL_TRUE_INPUT_DATA,
     WORKFLOW_PARAMETER_INPUT_INTEGER_DEFAULT,
@@ -163,6 +166,7 @@ input1:
 
 class BaseWorkflowsApiTestCase(ApiTestCase, RunsWorkflowFixtures):
     # TODO: Find a new file for this class.
+    dataset_populator: DatasetPopulator
 
     def setUp(self):
         super().setUp()
@@ -223,7 +227,7 @@ class BaseWorkflowsApiTestCase(ApiTestCase, RunsWorkflowFixtures):
 
     def _assert_history_job_count(self, history_id, n):
         jobs = self._history_jobs(history_id)
-        self.assertEqual(len(jobs), n)
+        assert len(jobs) == n
 
     def _download_workflow(self, workflow_id, style=None, history_id=None):
         return self.workflow_populator.download_workflow(workflow_id, style=style, history_id=history_id)
@@ -276,7 +280,7 @@ input1:
             assert details_dataset_new_col["metadata_startCol"] == 3
 
 
-class WorkflowsSharingApiTestCase(ApiTestCase, SharingApiTests):
+class TestWorkflowSharingApi(ApiTestCase, SharingApiTests):
 
     api_name = "workflows"
 
@@ -306,7 +310,9 @@ class WorkflowsSharingApiTestCase(ApiTestCase, SharingApiTests):
 # - Allow post to workflows/<workflow_id>/run in addition to posting to
 #    /workflows with id in payload.
 # - Much more testing obviously, always more testing.
-class WorkflowsApiTestCase(BaseWorkflowsApiTestCase, ChangeDatatypeTestCase):
+class TestWorkflowsApi(BaseWorkflowsApiTestCase, ChangeDatatypeTestCase):
+    dataset_populator: DatasetPopulator
+
     def test_show_valid(self):
         workflow_id = self.workflow_populator.simple_workflow("dummy")
         workflow_id = self.workflow_populator.simple_workflow("test_regular")
@@ -314,7 +320,7 @@ class WorkflowsApiTestCase(BaseWorkflowsApiTestCase, ChangeDatatypeTestCase):
         workflow = show_response.json()
         self._assert_looks_like_instance_workflow_representation(workflow)
         assert len(workflow["steps"]) == 3
-        self.assertEqual(sorted(step["id"] for step in workflow["steps"].values()), [0, 1, 2])
+        assert sorted(step["id"] for step in workflow["steps"].values()) == [0, 1, 2]
 
         show_response = self._get(f"workflows/{workflow_id}", {"legacy": True})
         workflow = show_response.json()
@@ -322,7 +328,7 @@ class WorkflowsApiTestCase(BaseWorkflowsApiTestCase, ChangeDatatypeTestCase):
         assert len(workflow["steps"]) == 3
         # Can't reay say what the legacy IDs are but must be greater than 3 because dummy
         # workflow was created first in this instance.
-        self.assertNotEqual(sorted(step["id"] for step in workflow["steps"].values()), [0, 1, 2])
+        assert sorted(step["id"] for step in workflow["steps"].values()) != [0, 1, 2]
 
     def test_show_invalid_key_is_400(self):
         show_response = self._get(f"workflows/{self._random_key()}")
@@ -367,7 +373,7 @@ class WorkflowsApiTestCase(BaseWorkflowsApiTestCase, ChangeDatatypeTestCase):
         self._assert_user_has_workflow_with_name(workflow_name)
         workflow_url = self._api_url(f"workflows/{workflow_id}", use_key=True)
         delete_response = delete(workflow_url)
-        self._assert_status_code_is(delete_response, 200)
+        self._assert_status_code_is(delete_response, 204)
         # Make sure workflow is no longer in index by default.
         assert workflow_name not in self._workflow_names()
 
@@ -377,6 +383,26 @@ class WorkflowsApiTestCase(BaseWorkflowsApiTestCase, ChangeDatatypeTestCase):
             workflow_url = self._api_url(f"workflows/{workflow_id}", use_key=True)
             delete_response = delete(workflow_url)
             self._assert_status_code_is(delete_response, 403)
+
+    def test_undelete(self):
+        workflow_id = self.workflow_populator.simple_workflow("test_undelete")
+        workflow_name = "test_undelete"
+        self._assert_user_has_workflow_with_name(workflow_name)
+        workflow_delete_url = self._api_url(f"workflows/{workflow_id}", use_key=True)
+        delete(workflow_delete_url)
+        workflow_undelete_url = self._api_url(f"workflows/{workflow_id}/undelete", use_key=True)
+        undelete_response = post(workflow_undelete_url)
+        self._assert_status_code_is(undelete_response, 204)
+        assert workflow_name in self._workflow_names()
+
+    def test_other_cannot_undelete(self):
+        workflow_id = self.workflow_populator.simple_workflow("test_other_undelete")
+        workflow_delete_url = self._api_url(f"workflows/{workflow_id}", use_key=True)
+        delete(workflow_delete_url)
+        with self._different_user():
+            workflow_undelete_url = self._api_url(f"workflows/{workflow_id}/undelete", use_key=True)
+            undelete_response = post(workflow_undelete_url)
+            self._assert_status_code_is(undelete_response, 403)
 
     def test_index(self):
         index_response = self._get("workflows")
@@ -389,7 +415,7 @@ class WorkflowsApiTestCase(BaseWorkflowsApiTestCase, ChangeDatatypeTestCase):
         assert [w for w in workflow_index if w["id"] == workflow_id]
         workflow_url = self._api_url(f"workflows/{workflow_id}", use_key=True)
         delete_response = delete(workflow_url)
-        self._assert_status_code_is(delete_response, 200)
+        self._assert_status_code_is(delete_response, 204)
         workflow_index = self._get("workflows").json()
         assert not [w for w in workflow_index if w["id"] == workflow_id]
         workflow_index = self._get("workflows?show_deleted=true").json()
@@ -768,8 +794,8 @@ class WorkflowsApiTestCase(BaseWorkflowsApiTestCase, ChangeDatatypeTestCase):
             assert order_index in uuids
             assert order_index in labels
 
-            self.assertEqual(uuids[order_index], step_dict["uuid"])
-            self.assertEqual(labels[order_index], step_dict["label"])
+            assert uuids[order_index] == step_dict["uuid"]
+            assert labels[order_index] == step_dict["label"]
 
         upload_response = self.__test_upload(workflow=original_workflow)
         workflow_id = upload_response.json()["id"]
@@ -1347,7 +1373,7 @@ steps:
     def test_workflow_run_output_collections(self) -> None:
         with self.dataset_populator.test_history() as history_id:
             self._run_workflow(WORKFLOW_WITH_OUTPUT_COLLECTION, history_id=history_id)
-            self.assertEqual("a\nc\nb\nd\n", self.dataset_populator.get_history_dataset_content(history_id, hid=0))
+            assert "a\nc\nb\nd\n" == self.dataset_populator.get_history_dataset_content(history_id, hid=0)
 
     @skip_without_tool("job_properties")
     @skip_without_tool("identifier_multiple_in_conditional")
@@ -1642,9 +1668,7 @@ steps:
             }
             invocation_id = self.__invoke_workflow(workflow_id, inputs=inputs, history_id=history_id)
             self.workflow_populator.wait_for_invocation_and_jobs(history_id, workflow_id, invocation_id)
-            self.assertEqual(
-                "a\nc\nb\nd\ne\ng\nf\nh\n", self.dataset_populator.get_history_dataset_content(history_id, hid=0)
-            )
+            assert "a\nc\nb\nd\ne\ng\nf\nh\n" == self.dataset_populator.get_history_dataset_content(history_id, hid=0)
 
     @skip_without_tool("cat_list")
     @skip_without_tool("collection_split_on_column")
@@ -1655,7 +1679,7 @@ steps:
             last_item_hid = details["hid"]
             assert last_item_hid == 7, f"Expected 7 history items, got {last_item_hid}"
             content = self.dataset_populator.get_history_dataset_content(history_id, hid=0)
-            self.assertEqual("10.0\n30.0\n20.0\n40.0\n", content)
+            assert "10.0\n30.0\n20.0\n40.0\n" == content
 
     @skip_without_tool("collection_split_on_column")
     @skip_without_tool("min_repeat")
@@ -1696,7 +1720,7 @@ steps:
             collection_details = self.dataset_populator.get_history_collection_details(history_id, hid=7)
             assert collection_details["populated_state"] == "ok"
             content = self.dataset_populator.get_history_dataset_content(history_id, hid=11)
-            self.assertEqual(content.strip(), "samp1\t10.0\nsamp2\t20.0")
+            assert content.strip() == "samp1\t10.0\nsamp2\t20.0"
 
     @skip_without_tool("cat")
     @skip_without_tool("collection_split_on_column")
@@ -1798,6 +1822,34 @@ steps:
                 history_id=history_id,
             )
 
+    @skip_without_tool("column_param_list")
+    def test_comma_separated_columns_with_trailing_newline(self):
+        # Tests that workflows with weird tool state continue to run.
+        # In this case the newline may have been added by the workflow editor
+        # text field that is used for data_column parameters
+        with self.dataset_populator.test_history() as history_id:
+            job_summary = self._run_workflow(
+                """class: GalaxyWorkflow
+steps:
+  empty_output:
+    tool_id: empty_output
+    outputs:
+      out_file1:
+        change_datatype: tabular
+  column_param_list:
+    tool_id: column_param_list
+    in:
+      input1: empty_output/out_file1
+    state:
+      col: '2,3\n'
+      col_names: 'B\n'
+""",
+                history_id=history_id,
+            )
+            job = self.dataset_populator.get_job_details(job_summary.jobs[0]["id"], full=True).json()
+            assert "col 2,3" in job["command_line"]
+            assert 'echo "col_names B" >>' in job["command_line"]
+
     @skip_without_tool("column_param")
     def test_runtime_data_column_parameter(self):
         with self.dataset_populator.test_history() as history_id:
@@ -1857,9 +1909,9 @@ outer_input:
             invocation_id = summary.invocation_id
 
             content = self.dataset_populator.get_history_dataset_content(history_id)
-            self.assertEqual(
-                "chrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n",
-                content,
+            assert (
+                content
+                == "chrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n"
             )
             steps = self.workflow_populator.get_invocation(invocation_id)["steps"]
             assert sum(1 for step in steps if step["subworkflow_invocation_id"] is None) == 3
@@ -1873,9 +1925,6 @@ outer_input:
             assert [step for step in subworkflow_invocation["steps"] if step["order_index"] == 1][0][
                 "workflow_step_label"
             ] == "random_lines"
-
-            bco = self.workflow_populator.get_biocompute_object(invocation_id)
-            self.workflow_populator.validate_biocompute_object(bco)
 
     @skip_without_tool("random_lines1")
     def test_run_subworkflow_runtime_parameters(self):
@@ -2006,12 +2055,13 @@ test_data:
         """
                 summary = self._run_workflow(workflow_text, test_data=test_data, history_id=history_id)
                 jobs = summary.jobs
-                assert len(jobs) == 4, "4 jobs expected, got %d jobs" % len(jobs)
+                num_jobs = len(jobs)
+                assert num_jobs == 2, f"2 jobs expected, got {num_jobs} jobs"
 
                 content = self.dataset_populator.get_history_dataset_content(history_id)
-                self.assertEqual(
-                    "chrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n",
-                    content,
+                assert (
+                    content
+                    == "chrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n"
                 )
 
         run_test(NESTED_WORKFLOW_AUTO_LABELS_MODERN_SYNTAX)
@@ -2052,7 +2102,7 @@ steps:
             invocation_id = self.__invoke_workflow(workflow_id, inputs=inputs, history_id=history_id)
             self.workflow_populator.wait_for_invocation_and_jobs(history_id, workflow_id, invocation_id)
             content = self.dataset_populator.get_history_dataset_content(history_id)
-            self.assertEqual(content.strip(), "samp1\t10.0\nsamp2\t20.0\nsamp1\t20.0\nsamp2\t40.0")
+            assert content.strip() == "samp1\t10.0\nsamp2\t20.0\nsamp1\t20.0\nsamp2\t40.0"
 
     @skip_without_tool("collection_paired_test")
     def test_workflow_flatten(self):
@@ -2186,7 +2236,7 @@ steps:
             invocation_id = summary.invocation_id
             bco = self.workflow_populator.get_biocompute_object(invocation_id)
             self.workflow_populator.validate_biocompute_object(bco)
-            self.assertEqual(bco["provenance_domain"]["name"], "Simple Workflow")
+            assert bco["provenance_domain"]["name"] == "Simple Workflow"
 
     @skip_without_tool("__APPLY_RULES__")
     def test_workflow_run_apply_rules(self):
@@ -2246,7 +2296,6 @@ input_c:
             def filter_jobs_by_tool(tool_id):
                 return [j for j in summary.jobs if j["tool_id"] == tool_id]
 
-            assert len(filter_jobs_by_tool("__DATA_FETCH__")) == 1, jobs
             assert len(filter_jobs_by_tool("exit_code_from_file")) == 2, jobs
             assert len(filter_jobs_by_tool("__FILTER_FAILED_DATASETS__")) == 1, jobs
             # Follow proves one job was filtered out of the result of cat1
@@ -2587,11 +2636,11 @@ test_data:
                 wait=True,
                 round_trip_format_conversion=True,
             )
-            self.assertEqual(
-                "chr6\t108722976\t108723115\tCCDS5067.1_cds_0_0_chr6_108722977_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n",
-                self.dataset_populator.get_history_dataset_content(history_id),
+            assert (
+                self.dataset_populator.get_history_dataset_content(history_id)
+                == "chr6\t108722976\t108723115\tCCDS5067.1_cds_0_0_chr6_108722977_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n"
             )
-            # self.assertEqual("chr16\t142908\t143003\tCCDS10397.1_cds_0_0_chr16_142909_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n", self.dataset_populator.get_history_dataset_content(history_id))
+            # assert self.dataset_populator.get_history_dataset_content(history_id) == "chr16\t142908\t143003\tCCDS10397.1_cds_0_0_chr16_142909_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n"
 
     @skip_without_tool("cat_list")
     @skip_without_tool("random_lines1")
@@ -2658,9 +2707,9 @@ outer_input:
                 wait=True,
                 round_trip_format_conversion=True,
             )
-            self.assertEqual(
-                "chr6\t108722976\t108723115\tCCDS5067.1_cds_0_0_chr6_108722977_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n",
-                self.dataset_populator.get_history_dataset_content(history_id),
+            assert (
+                self.dataset_populator.get_history_dataset_content(history_id)
+                == "chr6\t108722976\t108723115\tCCDS5067.1_cds_0_0_chr6_108722977_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n"
             )
 
     @skip_without_tool("cat_list")
@@ -2719,9 +2768,9 @@ outer_input:
                 wait=True,
                 round_trip_format_conversion=True,
             )
-            self.assertEqual(
-                "chr6\t108722976\t108723115\tCCDS5067.1_cds_0_0_chr6_108722977_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n",
-                self.dataset_populator.get_history_dataset_content(history_id),
+            assert (
+                self.dataset_populator.get_history_dataset_content(history_id)
+                == "chr6\t108722976\t108723115\tCCDS5067.1_cds_0_0_chr6_108722977_f\t0\t+\nchrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n"
             )
 
     @skip_without_tool("empty_list")
@@ -2764,7 +2813,7 @@ input1:
                 history_id=history_id,
                 wait=True,
             )
-            self.assertEqual("0\n", self.dataset_populator.get_history_dataset_content(history_id))
+            assert "0\n" == self.dataset_populator.get_history_dataset_content(history_id)
 
     @skip_without_tool("random_lines1")
     def test_change_datatype_collection_map_over(self):
@@ -2861,7 +2910,7 @@ input1:
                 wait=True,
                 round_trip_format_conversion=True,
             )
-            self.assertEqual("0\n", self.dataset_populator.get_history_dataset_content(history_id))
+            assert "0\n" == self.dataset_populator.get_history_dataset_content(history_id)
 
     @skip_without_tool("cat")
     def test_cancel_new_workflow_when_history_deleted(self):
@@ -2980,9 +3029,7 @@ input1:
             self.workflow_populator.wait_for_invocation_and_jobs(history_id, uploaded_workflow_id, invocation_id)
             invocation = self._invocation_details(uploaded_workflow_id, invocation_id)
             assert invocation["state"] == "scheduled"
-            self.assertEqual(
-                "reviewed\n1\nreviewed\n4\n", self.dataset_populator.get_history_dataset_content(history_id)
-            )
+            assert "reviewed\n1\nreviewed\n4\n" == self.dataset_populator.get_history_dataset_content(history_id)
 
     @skip_without_tool("cat")
     def test_cancel_workflow_invocation(self):
@@ -3143,6 +3190,40 @@ input1:
             )
             content = self.dataset_populator.get_history_dataset_content(history_id)
             assert "No input selected" in content
+
+    def test_run_with_optional_data_unspecified_survives_delayed_step(self):
+        with self.dataset_populator.test_history() as history_id:
+            self._run_workflow(
+                WORKFLOW_OPTIONAL_INPUT_DELAYED_SCHEDULING,
+                history_id=history_id,
+                wait=True,
+                assert_ok=True,
+            )
+
+    def test_run_subworkflow_with_optional_data_unspecified(self):
+        with self.dataset_populator.test_history() as history_id:
+            subworkflow = yaml.safe_load(
+                """
+class: GalaxyWorkflow
+inputs:
+  required: data
+steps:
+  nested_workflow:
+    in:
+      required: required
+test_data:
+  required:
+    value: 1.bed
+    type: File
+"""
+            )
+            subworkflow["steps"]["nested_workflow"]["run"] = yaml.safe_load(WORKFLOW_OPTIONAL_INPUT_DELAYED_SCHEDULING)
+            self._run_workflow(
+                subworkflow,
+                history_id=history_id,
+                wait=True,
+                assert_ok=True,
+            )
 
     def test_run_with_non_optional_data_unspecified_fails_invocation(self):
         with self.dataset_populator.test_history() as history_id:
@@ -3378,7 +3459,7 @@ text_input:
 
             self.dataset_populator.wait_for_history(history_id, assert_ok=True)
             content = self.dataset_populator.get_history_dataset_content(history_id)
-            self.assertEqual("chrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n", content)
+            assert "chrX\t152691446\t152691471\tCCDS14735.1_cds_0_0_chrX_152691447_f\t0\t+\n" == content
 
     def test_run_with_numeric_input_connection(self):
         history_id = self.dataset_populator.new_history()
@@ -3584,10 +3665,8 @@ outer_input:
             for i, (item_one, item_two) in enumerate(zip(history_one_contents, history_two_contents)):
                 assert (
                     item_one["dataset_id"] == item_two["dataset_id"]
-                ), 'Dataset ids should match, but "%s" and "%s" are not the same for History item %i.' % (
-                    item_one["dataset_id"],
-                    item_two["dataset_id"],
-                    i + 1,
+                ), 'Dataset ids should match, but "{}" and "{}" are not the same for History item {}.'.format(
+                    item_one["dataset_id"], item_two["dataset_id"], i + 1
                 )
 
     def test_cannot_run_inaccessible_workflow(self):
@@ -3640,13 +3719,11 @@ outer_input:
             self.workflow_populator.invoke_workflow_and_wait(
                 workflow_id, history_id=history_id, request=workflow_request
             )
-            self.assertEqual(
-                "1 2 3\n4 5 6\n7 8 9\n0 a b\n", self.dataset_populator.get_history_dataset_content(history_id)
-            )
+            assert "1 2 3\n4 5 6\n7 8 9\n0 a b\n" == self.dataset_populator.get_history_dataset_content(history_id)
 
     def test_workflow_stability(self):
         # Run this index stability test with following command:
-        #   ./run_tests.sh test/api/test_workflows.py:WorkflowsApiTestCase.test_workflow_stability
+        #   ./run_tests.sh test/api/test_workflows.py:TestWorkflowsApi.test_workflow_stability
         num_tests = 1
         for workflow_file in ["test_workflow_topoambigouity", "test_workflow_topoambigouity_auto_laidout"]:
             workflow = self.workflow_populator.load_workflow_from_resource(workflow_file)
@@ -4830,10 +4907,10 @@ steps:
             t2 = self.dataset_populator.get_history_dataset_content(history_id, hid=10)
             t3 = self.dataset_populator.get_history_dataset_content(history_id, hid=13)
             t4 = self.dataset_populator.get_history_dataset_content(history_id, hid=16)
-            self.assertEqual(r1, t1)
-            self.assertEqual(r2, t2)
-            self.assertEqual(r3, t3)
-            self.assertEqual(r4, t4)
+            assert r1 == t1
+            assert r2 == t2
+            assert r3 == t3
+            assert r4 == t4
 
     @skip_without_tool("cat1")
     @skip_without_tool("addValue")
@@ -4882,10 +4959,10 @@ steps:
             t2 = self.dataset_populator.get_history_dataset_content(history_id, hid=10)
             t3 = self.dataset_populator.get_history_dataset_content(history_id, hid=13)
             t4 = self.dataset_populator.get_history_dataset_content(history_id, hid=16)
-            self.assertEqual(r1, t1)
-            self.assertEqual(r2, t2)
-            self.assertEqual(r3, t3)
-            self.assertEqual(r4, t4)
+            assert r1 == t1
+            assert r2 == t2
+            assert r3 == t3
+            assert r4 == t4
 
     @skip_without_tool("validation_default")
     def test_parameter_substitution_sanitization(self):
@@ -4893,9 +4970,7 @@ steps:
         run_workflow_response, history_id = self._run_validation_workflow_with_substitions(substitions)
 
         self.dataset_populator.wait_for_history(history_id, assert_ok=True)
-        self.assertEqual(
-            "__dq__ X echo __dq__moo\n", self.dataset_populator.get_history_dataset_content(history_id, hid=1)
-        )
+        assert "__dq__ X echo __dq__moo\n" == self.dataset_populator.get_history_dataset_content(history_id, hid=1)
 
     @skip_without_tool("validation_repeat")
     def test_parameter_substitution_validation_value_errors_0(self):
@@ -4986,7 +5061,7 @@ steps:
         )
         workflow_request["parameters"] = params
         self.workflow_populator.invoke_workflow_and_wait(workflow_id, request=workflow_request)
-        self.assertEqual("2\n", self.dataset_populator.get_history_dataset_content(history_id))
+        assert "2\n" == self.dataset_populator.get_history_dataset_content(history_id)
 
     @skip_without_tool("random_lines1")
     def test_run_replace_params_nested_normalized(self):
@@ -5002,7 +5077,7 @@ steps:
         workflow_request["parameters"] = params
         workflow_request["parameters_normalized"] = False
         self.workflow_populator.invoke_workflow_and_wait(workflow_id, request=workflow_request)
-        self.assertEqual("2\n", self.dataset_populator.get_history_dataset_content(history_id))
+        assert "2\n" == self.dataset_populator.get_history_dataset_content(history_id)
 
     @skip_without_tool("random_lines1")
     def test_run_replace_params_over_default(self):
@@ -5484,7 +5559,7 @@ input_c:
         hda_summary = next(hc for hc in history_contents if hc["hid"] == hid)
         hda_info_response = self._get(f"{contents_url}/{hda_summary['id']}")
         self._assert_status_code_is(hda_info_response, 200)
-        self.assertEqual(hda_info_response.json()["metadata_data_lines"], lines)
+        assert hda_info_response.json()["metadata_data_lines"] == lines
 
     def __history_contents(self, history_id):
         contents_url = f"histories/{history_id}/contents"
@@ -5534,7 +5609,7 @@ input_c:
         return invocation_ids
 
 
-class AdminWorkflowsApiTestCase(BaseWorkflowsApiTestCase):
+class TestAdminWorkflowsApi(BaseWorkflowsApiTestCase):
 
     require_admin_user = True
 
@@ -5578,7 +5653,4 @@ test_data:
             inputs=json.dumps({"input1": self._ds_entry(hda1)}),
         )
         self.workflow_populator.invoke_workflow_and_wait(workflow_id, history_id=history_id, request=workflow_request)
-        self.assertEqual(
-            "Hello World Second!\nhello world 2\n",
-            self.dataset_populator.get_history_dataset_content(history_id),
-        )
+        assert self.dataset_populator.get_history_dataset_content(history_id) == "Hello World Second!\nhello world 2\n"

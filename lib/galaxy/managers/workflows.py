@@ -42,8 +42,13 @@ from galaxy import (
     util,
 )
 from galaxy.job_execution.actions.post import ActionBox
-from galaxy.managers import sharable
+from galaxy.managers import (
+    deletable,
+    sharable,
+)
+from galaxy.managers.base import decode_id
 from galaxy.managers.context import ProvidesUserContext
+from galaxy.managers.executables import artifact_class
 from galaxy.model import StoredWorkflow
 from galaxy.model.index_filter_util import (
     append_user_filter,
@@ -90,8 +95,6 @@ from galaxy.workflow.refactor.schema import (
 from galaxy.workflow.reports import generate_report
 from galaxy.workflow.resources import get_resource_mapper_function
 from galaxy.workflow.steps import attach_ordered_steps
-from .base import decode_id
-from .executables import artifact_class
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +110,7 @@ INDEX_SEARCH_FILTERS = {
 }
 
 
-class WorkflowsManager(sharable.SharableModelManager):
+class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManagerMixin):
     """Handle CRUD type operations related to workflows. More interesting
     stuff regarding workflow execution, step sorting, etc... can be found in
     the galaxy.workflow module.
@@ -163,7 +166,6 @@ class WorkflowsManager(sharable.SharableModelManager):
         query = query.options(latest_workflow_load)
         query = query.filter(or_(*filters))
         query = query.filter(model.StoredWorkflow.table.c.hidden == (true() if show_hidden else false()))
-        query = query.filter(model.StoredWorkflow.table.c.deleted == (true() if show_deleted else false()))
         if payload.search:
             search_query = payload.search
             parsed_search = parse_filters_structured(search_query, INDEX_SEARCH_FILTERS)
@@ -191,6 +193,9 @@ class WorkflowsManager(sharable.SharableModelManager):
                     elif key == "is":
                         if q == "published":
                             query = query.filter(model.StoredWorkflow.published == true())
+                        elif q == "deleted":
+                            query = query.filter(model.StoredWorkflow.deleted == true())
+                            show_deleted = true
                         elif q == "shared_with_me":
                             if not show_shared:
                                 message = "Can only use tag is:shared_with_me if show_shared parameter also true."
@@ -210,6 +215,7 @@ class WorkflowsManager(sharable.SharableModelManager):
                             term,
                         )
                     )
+        query = query.filter(model.StoredWorkflow.table.c.deleted == (true() if show_deleted else false()))
         if include_total_count:
             total_matches = query.count()
         else:
@@ -242,19 +248,19 @@ class WorkflowsManager(sharable.SharableModelManager):
                     trans.app.model.Workflow.uuid == workflow_uuid,
                 )
             )
-        elif by_stored_id:
-            workflow_id = decode_id(self.app, workflow_id)
-            workflow_query = trans.sa_session.query(trans.app.model.StoredWorkflow).filter(
-                trans.app.model.StoredWorkflow.id == workflow_id
-            )
         else:
-            workflow_id = decode_id(self.app, workflow_id)
-            workflow_query = trans.sa_session.query(trans.app.model.StoredWorkflow).filter(
-                and_(
-                    trans.app.model.StoredWorkflow.id == trans.app.model.Workflow.stored_workflow_id,
-                    trans.app.model.Workflow.id == workflow_id,
+            workflow_id = workflow_id if isinstance(workflow_id, int) else decode_id(self.app, workflow_id)
+            if by_stored_id:
+                workflow_query = trans.sa_session.query(trans.app.model.StoredWorkflow).filter(
+                    trans.app.model.StoredWorkflow.id == workflow_id
                 )
-            )
+            else:
+                workflow_query = trans.sa_session.query(trans.app.model.StoredWorkflow).filter(
+                    and_(
+                        trans.app.model.StoredWorkflow.id == trans.app.model.Workflow.stored_workflow_id,
+                        trans.app.model.Workflow.id == workflow_id,
+                    )
+                )
         stored_workflow = workflow_query.options(
             joinedload("annotations"),
             joinedload("tags"),
@@ -368,7 +374,9 @@ class WorkflowsManager(sharable.SharableModelManager):
         return workflow_invocation
 
     def get_invocation_report(self, trans, invocation_id, **kwd):
-        decoded_workflow_invocation_id = trans.security.decode_id(invocation_id)
+        decoded_workflow_invocation_id = (
+            trans.security.decode_id(invocation_id) if isinstance(invocation_id, str) else invocation_id
+        )
         workflow_invocation = self.get_invocation(trans, decoded_workflow_invocation_id)
         generator_plugin_type = kwd.get("generator_plugin_type")
         runtime_report_config_json = kwd.get("runtime_report_config_json")
@@ -1043,6 +1051,7 @@ class WorkflowContentsManager(UsesAnnotations):
                 step_dict["inputs"] = do_inputs(module.get_runtime_inputs(), step.state.inputs, "", step)
             step_dicts.append(step_dict)
         return {
+            "name": workflow.name,
             "steps": step_dicts,
         }
 
@@ -1074,8 +1083,9 @@ class WorkflowContentsManager(UsesAnnotations):
             self.__set_default_label(step, module, step.tool_inputs)
             # Fix any missing parameters
             upgrade_message_dict = module.check_and_update_state() or {}
-            if hasattr(module, "version_changes") and module.version_changes:
-                upgrade_message_dict[module.get_name()] = "\n".join(module.version_changes)
+            version_changes = getattr(module, "version_changes", None)
+            if version_changes:
+                upgrade_message_dict[module.get_name()] = "\n".join(version_changes)
             # Get user annotation.
             config_form = module.get_config_form(step=step)
             annotation_str = self.get_item_annotation_str(trans.sa_session, trans.user, step) or ""
@@ -1092,7 +1102,7 @@ class WorkflowContentsManager(UsesAnnotations):
                 "outputs": module.get_all_outputs(),
                 "config_form": config_form,
                 "annotation": annotation_str,
-                "post_job_actions": {},
+                "post_job_actions": module.get_post_job_actions({}),
                 "uuid": str(step.uuid) if step.uuid else None,
                 "workflow_outputs": [],
             }
@@ -1102,7 +1112,7 @@ class WorkflowContentsManager(UsesAnnotations):
             input_connections = step.input_connections
             input_connections_type = {}
             multiple_input = {}  # Boolean value indicating if this can be multiple
-            if (step.type is None or step.type == "tool") and module.tool:
+            if isinstance(module, ToolModule) and module.tool:
                 # Determine full (prefixed) names of valid input datasets
                 data_input_names = {}
 
@@ -1265,10 +1275,11 @@ class WorkflowContentsManager(UsesAnnotations):
                         step_data_output["collection_type"] = collection_type
         return steps
 
-    def _workflow_to_dict_export(self, trans, stored=None, workflow=None, internal=False):
+    def _workflow_to_dict_export(self, trans, stored=None, workflow=None, internal=False, allow_upgrade=False):
         """Export the workflow contents to a dictionary ready for JSON-ification and export.
 
         If internal, use content_ids instead subworkflow definitions.
+        If `allow_upgrade`, the workflow and sub-workflows might use updated tool versions when refactoring.
         """
         annotation_str = ""
         tag_str = ""
@@ -1309,7 +1320,7 @@ class WorkflowContentsManager(UsesAnnotations):
                 raise exceptions.MessageException(f"Unrecognized step type: {step.type}")
             # Get user annotation.
             annotation_str = self.get_item_annotation_str(trans.sa_session, trans.user, step) or ""
-            content_id = module.get_content_id()
+            content_id = module.get_content_id() if allow_upgrade else step.content_id
             # Export differences for backward compatibility
             tool_state = module.get_export_state()
             # Step info
@@ -1319,7 +1330,7 @@ class WorkflowContentsManager(UsesAnnotations):
                 "content_id": content_id,
                 "tool_id": content_id,  # For workflows exported to older Galaxies,
                 # eliminate after a few years...
-                "tool_version": step.tool_version,
+                "tool_version": module.get_version() if allow_upgrade else step.tool_version,
                 "name": module.get_name(),
                 "tool_state": json.dumps(tool_state),
                 "errors": module.get_errors(),
@@ -1328,7 +1339,7 @@ class WorkflowContentsManager(UsesAnnotations):
                 "annotation": annotation_str,
             }
             # Add tool shed repository information and post-job actions to step dict.
-            if module.type == "tool":
+            if isinstance(module, ToolModule):
                 if module.tool and module.tool.tool_shed:
                     step_dict["tool_shed_repository"] = {
                         "name": module.tool.repository_name,
@@ -1409,7 +1420,7 @@ class WorkflowContentsManager(UsesAnnotations):
 
             # Connections
             input_connections = step.input_connections
-            if step.type is None or step.type == "tool":
+            if isinstance(module, ToolModule):
                 # Determine full (prefixed) names of valid input datasets
                 data_input_names = {}
 
@@ -1469,6 +1480,7 @@ class WorkflowContentsManager(UsesAnnotations):
         item["name"] = workflow.name
         item["url"] = url_for("workflow", id=item["id"])
         item["owner"] = stored.user.username
+        item["slug"] = stored.slug
         inputs = {}
         for step in workflow.input_steps:
             step_type = step.type
@@ -1756,7 +1768,9 @@ class WorkflowContentsManager(UsesAnnotations):
     def do_refactor(self, trans, stored_workflow, refactor_request):
         """Apply supplied actions to stored_workflow.latest_workflow to build a new version."""
         workflow = stored_workflow.latest_workflow
-        as_dict = self._workflow_to_dict_export(trans, stored_workflow, workflow=workflow, internal=True)
+        as_dict = self._workflow_to_dict_export(
+            trans, stored_workflow, workflow=workflow, internal=True, allow_upgrade=True
+        )
         raw_workflow_description = self.normalize_workflow_format(trans, as_dict)
         workflow_update_options = WorkflowUpdateOptions(
             fill_defaults=False,

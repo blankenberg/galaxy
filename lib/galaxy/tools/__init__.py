@@ -180,7 +180,6 @@ GALAXY_LIB_TOOLS_UNVERSIONED = [
     "Interval_Maf_Merged_Fasta2",
     "GeneBed_Maf_Fasta2",
     "maf_stats1",
-    "Interval2Maf1",
     "Interval2Maf_pairwise1",
     "MAF_To_Interval1",
     "MAF_filter",
@@ -235,6 +234,7 @@ GALAXY_LIB_TOOLS_VERSIONED = {
     "Convert characters1": packaging.version.parse("1.0.1"),
     "substitutions1": packaging.version.parse("1.0.1"),
     "winSplitter": packaging.version.parse("1.0.1"),
+    "Interval2Maf1": packaging.version.parse("1.0.1+galaxy0"),
 }
 
 REQUIRE_FULL_DIRECTORY = {
@@ -249,20 +249,20 @@ IMPLICITLY_REQUIRED_TOOL_FILES: Dict[str, Dict] = {
     # "foobar": {"required": REQUIRE_FULL_DIRECTORY}
     # if no version is specified, all versions without explicit RequiredFiles will be selected
     "circos": {"required": REQUIRE_FULL_DIRECTORY},
-    "cp_image_math": {"required": {"includes": [{"path": "cp_common_functions.py", "path_type": "literal"}]}},
-    "enumerate_charges": {"required": {"includes": [{"path": "site_substructures.smarts", "path_type": "literal"}]}},
+    "cp_image_math": {"required": {"includes": [{"path": "*.py", "path_type": "glob"}]}},
+    "enumerate_charges": {"required": REQUIRE_FULL_DIRECTORY},
     "fasta_compute_length": {"required": {"includes": [{"path": "utils/*", "path_type": "glob"}]}},
     "fasta_concatenate0": {"required": {"includes": [{"path": "utils/*", "path_type": "glob"}]}},
     "filter_tabular": {"required": {"includes": [{"path": "*.py", "path_type": "glob"}]}},
     "flanking_features_1": {"required": {"includes": [{"path": "utils/*", "path_type": "glob"}]}},
     "gops_intersect_1": {"required": {"includes": [{"path": "utils/*", "path_type": "glob"}]}},
     "gops_subtract_1": {"required": {"includes": [{"path": "utils/*", "path_type": "glob"}]}},
-    "maxquant": {"required": {"includes": [{"path": "mqparam.py", "path_type": "literal"}]}},
-    "maxquant_mqpar": {"required": {"includes": [{"path": "mqparam.py", "path_type": "literal"}]}},
+    "maxquant": {"required": {"includes": [{"path": "*.py", "path_type": "glob"}]}},
+    "maxquant_mqpar": {"required": {"includes": [{"path": "*.py", "path_type": "glob"}]}},
     "query_tabular": {"required": {"includes": [{"path": "*.py", "path_type": "glob"}]}},
     "shasta": {"required": {"includes": [{"path": "configs/*", "path_type": "glob"}]}},
     "sqlite_to_tabular": {"required": {"includes": [{"path": "*.py", "path_type": "glob"}]}},
-    "sucos_max_score": {"required": {"includes": [{"path": "utils.py", "path_type": "literal"}]}},
+    "sucos_max_score": {"required": {"includes": [{"path": "*.py", "path_type": "glob"}]}},
 }
 
 
@@ -277,7 +277,7 @@ WORKFLOW_SAFE_TOOL_VERSION_UPDATES = {
     "__BUILD_LIST__": safe_update(packaging.version.parse("1.0.0"), packaging.version.parse("1.1.0")),
     "__APPLY_RULES__": safe_update(packaging.version.parse("1.0.0"), packaging.version.parse("1.1.0")),
     "__EXTRACT_DATASET__": safe_update(packaging.version.parse("1.0.0"), packaging.version.parse("1.0.1")),
-    "Grep1": safe_update(packaging.version.parse("1.0.1"), packaging.version.parse("1.0.3")),
+    "Grep1": safe_update(packaging.version.parse("1.0.1"), packaging.version.parse("1.0.4")),
     "Show beginning1": safe_update(packaging.version.parse("1.0.0"), packaging.version.parse("1.0.1")),
     "Show tail1": safe_update(packaging.version.parse("1.0.0"), packaging.version.parse("1.0.1")),
     "sort1": safe_update(packaging.version.parse("1.1.0"), packaging.version.parse("1.2.0")),
@@ -564,6 +564,7 @@ class Tool(Dictifiable):
     Represents a computational tool that can be executed through Galaxy.
     """
 
+    job_tool_configurations: list
     tool_type = "default"
     requires_setting_metadata = True
     produces_entry_points = False
@@ -1205,7 +1206,7 @@ class Tool(Dictifiable):
         if getattr(self, "tool_shed", None):
             tool_dir = Path(self.tool_dir)
             for repo_dir in itertools.chain([tool_dir], tool_dir.parents):
-                if repo_dir.name == self.repository_name:
+                if repo_dir.name == self.repository_name and repo_dir.parent.name == self.installed_changeset_revision:
                     return str(repo_dir)
             else:
                 log.error(f"Problem finding repository dir for tool '{self.id}'")
@@ -1227,7 +1228,10 @@ class Tool(Dictifiable):
             # Fallback to Galaxy test data directory for builtin tools, tools
             # under development, and some older ToolShed published tools that
             # used stock test data.
-            test_data = self.app.test_data_resolver.get_filename(filename)
+            try:
+                test_data = self.app.test_data_resolver.get_filename(filename)
+            except ValueError:
+                test_data = None
         return test_data
 
     def __walk_test_data(self, dir, filename):
@@ -3527,7 +3531,7 @@ class RelabelFromFileTool(DatabaseOperationTool):
                 add_copied_value_to_new_elements(new_labels[i], dce_object)
         for key in new_elements.keys():
             if not re.match(r"^[\w\- \.,]+$", key):
-                raise Exception(f"Invalid new colleciton identifier [{key}]")
+                raise Exception(f"Invalid new collection identifier [{key}]")
         self._add_datasets_to_history(history, new_elements.values())
         output_collections.create_collection(
             next(iter(self.outputs.values())), "output", elements=new_elements, propagate_hda_tags=False
@@ -3669,6 +3673,23 @@ class FilterFromFileTool(DatabaseOperationTool):
         )
 
 
+class DuplicateFileToCollectionTool(DatabaseOperationTool):
+    tool_type = "duplicate_file_to_collection"
+
+    def produce_outputs(self, trans, out_data, output_collections, incoming, history, **kwds):
+        hda = incoming["input"]
+        number = incoming["number"]
+        element_identifier = incoming["element_identifier"]
+        elements = {
+            f"{element_identifier} {n}": hda.copy(copy_tags=hda.tags, flush=False) for n in range(1, number + 1)
+        }
+
+        self._add_datasets_to_history(history, elements.values())
+        output_collections.create_collection(
+            next(iter(self.outputs.values())), "output", elements=elements, propagate_hda_tags=False
+        )
+
+
 # Populate tool_type to ToolClass mappings
 tool_types = {}
 TOOL_CLASSES: List[Type[Tool]] = [
@@ -3685,6 +3706,7 @@ TOOL_CLASSES: List[Type[Tool]] = [
     MergeCollectionTool,
     RelabelFromFileTool,
     FilterFromFileTool,
+    DuplicateFileToCollectionTool,
     BuildListCollectionTool,
     ExtractDatasetCollectionTool,
     DataDestinationTool,

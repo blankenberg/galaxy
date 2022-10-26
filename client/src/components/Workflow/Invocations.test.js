@@ -1,4 +1,4 @@
-import Invocations from "../Workflow/Invocations";
+import Invocations from "./Invocations";
 import { mount } from "@vue/test-utils";
 import axios from "axios";
 import MockAdapter from "axios-mock-adapter";
@@ -96,6 +96,9 @@ describe("Invocations.vue", () => {
                 propsData,
                 computed: {
                     getWorkflowNameByInstanceId: (state) => (id) => "workflow name",
+                    getStoredWorkflowIdByInstanceId: (state) => (id) => {
+                        return "workflowId";
+                    },
                     getWorkflowByInstanceId: (state) => (id) => {
                         return { id: "workflowId" };
                     },

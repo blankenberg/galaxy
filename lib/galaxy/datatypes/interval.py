@@ -86,6 +86,7 @@ class Interval(Tabular):
     MetadataElement(name="endCol", default=3, desc="End column", param=metadata.ColumnParameter)
     MetadataElement(
         name="strandCol",
+        default=0,
         desc="Strand column (click box & select)",
         param=metadata.ColumnParameter,
         optional=True,
@@ -340,7 +341,7 @@ class Interval(Tabular):
                 except ParseError as e:
                     return DatatypeValidation.invalid(util.unicodify(e))
                 except StopIteration:
-                    return DatatypeValidation.valid()
+                    return DatatypeValidation.validated()
 
     def repair_methods(self, dataset):
         """Return options for removing errors along with a description"""
@@ -459,6 +460,7 @@ class Bed(Interval):
     MetadataElement(name="endCol", default=3, desc="End column", param=metadata.ColumnParameter)
     MetadataElement(
         name="strandCol",
+        default=0,
         desc="Strand column (click box & select)",
         param=metadata.ColumnParameter,
         optional=True,
@@ -687,6 +689,7 @@ class BedStrict(Bed):
     MetadataElement(name="endCol", default=3, desc="End column", readonly=True, param=metadata.MetadataParameter)
     MetadataElement(
         name="strandCol",
+        default=0,
         desc="Strand column (click box & select)",
         readonly=True,
         param=metadata.MetadataParameter,
@@ -1613,6 +1616,7 @@ class ENCODEPeak(Interval):
     MetadataElement(name="endCol", default=3, desc="End column", param=metadata.ColumnParameter)
     MetadataElement(
         name="strandCol",
+        default=0,
         desc="Strand column (click box & select)",
         param=metadata.ColumnParameter,
         optional=True,
@@ -1723,9 +1727,3 @@ class ScIdx(Tabular):
         if count >= 1:
             return True
         return False
-
-
-if __name__ == "__main__":
-    import doctest
-
-    doctest.testmod(sys.modules[__name__])

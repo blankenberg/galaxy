@@ -31,7 +31,11 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from hashlib import md5
 from os.path import relpath
-from pathlib import Path
+from typing import (
+    Any,
+    Optional,
+    overload,
+)
 from urllib.parse import (
     urlencode,
     urlparse,
@@ -46,6 +50,7 @@ from boltons.iterutils import (
 )
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
+from typing_extensions import Literal
 
 try:
     import grp
@@ -80,6 +85,7 @@ from .path import (  # noqa: F401
     safe_contains,
     safe_makedirs,
     safe_relpath,
+    StrPath,
 )
 
 try:
@@ -278,7 +284,7 @@ def unique_id(KEY_SIZE=128):
     return md5(random_bits).hexdigest()
 
 
-def parse_xml(fname: typing.Union[str, Path], strip_whitespace=True, remove_comments=True):
+def parse_xml(fname: StrPath, strip_whitespace=True, remove_comments=True) -> etree.ElementTree:
     """Returns a parsed xml tree"""
     parser = None
     if remove_comments and LXML_AVAILABLE:
@@ -305,7 +311,7 @@ def parse_xml(fname: typing.Union[str, Path], strip_whitespace=True, remove_comm
     return tree
 
 
-def parse_xml_string(xml_string, strip_whitespace=True):
+def parse_xml_string(xml_string, strip_whitespace=True) -> etree.Element:
     try:
         tree = etree.fromstring(xml_string)
     except ValueError as e:
@@ -1012,7 +1018,7 @@ def asbool(obj):
     return bool(obj)
 
 
-def string_as_bool(string: typing.Any) -> bool:
+def string_as_bool(string: Any) -> bool:
     if str(string).lower() in ("true", "yes", "on", "1"):
         return True
     else:
@@ -1038,7 +1044,7 @@ def string_as_bool_or_none(string):
         return False
 
 
-def listify(item, do_strip=False) -> typing.List[typing.Any]:
+def listify(item, do_strip=False) -> typing.List[Any]:
     """
     Make a single item a single item list.
 
@@ -1089,7 +1095,35 @@ def roundify(amount, sfs=2):
         return amount[0:sfs] + "0" * (len(amount) - sfs)
 
 
-def unicodify(value, encoding=DEFAULT_ENCODING, error="replace", strip_null=False, log_exception=True):
+@overload
+def unicodify(  # type: ignore[misc]
+    value: Literal[None],
+    encoding: str = DEFAULT_ENCODING,
+    error: str = "replace",
+    strip_null: bool = False,
+    log_exception: bool = True,
+) -> None:
+    ...
+
+
+@overload
+def unicodify(
+    value: Any,
+    encoding: str = DEFAULT_ENCODING,
+    error: str = "replace",
+    strip_null: bool = False,
+    log_exception: bool = True,
+) -> str:
+    ...
+
+
+def unicodify(
+    value: Any,
+    encoding: str = DEFAULT_ENCODING,
+    error: str = "replace",
+    strip_null: bool = False,
+    log_exception: bool = True,
+) -> Optional[str]:
     """
     Returns a Unicode string or None.
 
@@ -1818,9 +1852,3 @@ class StructuredExecutionTimer:
     @property
     def elapsed(self):
         return time.time() - self.begin
-
-
-if __name__ == "__main__":
-    import doctest
-
-    doctest.testmod(sys.modules[__name__], verbose=False)

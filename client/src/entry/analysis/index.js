@@ -1,6 +1,6 @@
 import { standardInit, addInitialization } from "onload";
 
-import Vue from "vue";
+import Vue, { provide } from "vue";
 import App from "./App.vue";
 import store from "store";
 import { getRouter } from "./router";
@@ -9,12 +9,14 @@ addInitialization((Galaxy) => {
     console.log("App setup");
     const router = getRouter(Galaxy);
     new Vue({
-        el: "body",
+        el: "#app",
         render: (h) => h(App),
+        setup() {
+            provide("store", store);
+        },
         router: router,
         store: store,
     });
-    Galaxy.router = router;
 });
 
 window.addEventListener("load", () => standardInit("app"));

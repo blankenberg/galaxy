@@ -5,7 +5,9 @@ from pydantic import (
     Field,
 )
 
+from galaxy.util.hash_util import HashFunctionNameEnum
 from .schema import (
+    BcoGenerationParametersMixin,
     DatasetSourceType,
     HistoryContentType,
     StoreExportPayload,
@@ -55,13 +57,17 @@ class GenerateHistoryContentDownload(StoreExportPayload):
     user: RequestUser
 
 
-class GenerateInvocationDownload(StoreExportPayload):
+class BcoGenerationTaskParametersMixin(BcoGenerationParametersMixin):
+    galaxy_url: str
+
+
+class GenerateInvocationDownload(StoreExportPayload, BcoGenerationTaskParametersMixin):
     invocation_id: int
     short_term_storage_request_id: str
     user: RequestUser
 
 
-class WriteInvocationTo(WriteStoreToPayload):
+class WriteInvocationTo(WriteStoreToPayload, BcoGenerationTaskParametersMixin):
     invocation_id: int
     user: RequestUser
 
@@ -101,3 +107,10 @@ class MaterializeDatasetInstanceTaskRequest(BaseModel):
             "- The encoded id of the the HDA\n"
         ),
     )
+
+
+class ComputeDatasetHashTaskRequest(BaseModel):
+    dataset_id: int
+    extra_files_path: Optional[str]
+    hash_function: HashFunctionNameEnum
+    user: RequestUser

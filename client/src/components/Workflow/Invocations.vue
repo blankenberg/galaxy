@@ -1,8 +1,8 @@
 <template>
-    <div class="invocations-list">
-        <h2 class="mb-3">
-            <span id="invocations-title">{{ title }}</span>
-        </h2>
+    <div class="invocations-list" aria-labelledby="invocations-title">
+        <h1 id="invocations-title" class="mb-3 h-lg">
+            {{ title }}
+        </h1>
         <b-alert v-if="headerMessage" variant="info" show>
             {{ headerMessage }}
         </b-alert>
@@ -65,7 +65,10 @@
                 <UtcDate :date="data.value" mode="elapsed" />
             </template>
             <template v-slot:cell(execute)="data">
-                <WorkflowRunButton :id="getWorkflowByInstanceId(data.item.workflow_id).id" :root="root" />
+                <WorkflowRunButton
+                    v-if="getStoredWorkflowIdByInstanceId(data.item.workflow_id)"
+                    :id="getStoredWorkflowIdByInstanceId(data.item.workflow_id)"
+                    :root="root" />
             </template>
         </b-table>
         <b-pagination
@@ -80,7 +83,7 @@
 import { getAppRoot } from "onload/loadConfig";
 import { getGalaxyInstance } from "app";
 import { invocationsProvider } from "components/providers/InvocationsProvider";
-import { WorkflowInvocationState } from "components/WorkflowInvocationState";
+import WorkflowInvocationState from "components/WorkflowInvocationState/WorkflowInvocationState";
 import WorkflowRunButton from "./WorkflowRunButton.vue";
 import UtcDate from "components/UtcDate";
 import { mapCacheActions } from "vuex-cache";
@@ -122,7 +125,7 @@ export default {
         };
     },
     computed: {
-        ...mapGetters(["getWorkflowNameByInstanceId", "getWorkflowByInstanceId"]),
+        ...mapGetters(["getWorkflowNameByInstanceId", "getWorkflowByInstanceId", "getStoredWorkflowIdByInstanceId"]),
         ...mapGetters("history", ["getHistoryById", "getHistoryNameById"]),
         title() {
             let title = `Workflow Invocations`;
@@ -187,19 +190,19 @@ export default {
 .invocations-table {
     min-width: 40rem;
 }
-.table::v-deep .col-name {
+.table:deep(.col-name) {
     width: 40%;
 }
-.table::v-deep .col-history {
+.table:deep(.col-history) {
     width: 20%;
 }
-.table::v-deep .col-small {
+.table:deep(.col-small) {
     width: 100px;
 }
-.table::v-deep .col-button {
+.table:deep(.col-button) {
     width: 50px;
 }
-.table::v-deep .truncate {
+.table:deep(.truncate) {
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;

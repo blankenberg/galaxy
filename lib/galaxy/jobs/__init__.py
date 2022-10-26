@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pwd
+import shlex
 import shutil
 import sys
 import time
@@ -1579,7 +1580,6 @@ class MinimalJobWrapper(HasResourceParameters):
 
     def set_job_destination(self, job_destination, external_id=None, flush=True, job=None):
         """Subclasses should implement this to persist a destination, if necessary."""
-        pass
 
     def _set_object_store_ids(self, job):
         if job.object_store_id:
@@ -1797,7 +1797,7 @@ class MinimalJobWrapper(HasResourceParameters):
                     else:
                         # Prior to fail we need to set job.state
                         job.set_state(final_job_state)
-                        return self.fail(f"Job {job.id}'s output dataset(s) could not be read")
+                        return fail(f"Job {job.id}'s output dataset(s) could not be read")
 
         job_context = ExpressionContext(dict(stdout=job.stdout, stderr=job.stderr))
         if extended_metadata:
@@ -2129,10 +2129,8 @@ class MinimalJobWrapper(HasResourceParameters):
             raise Exception(f"Unknown target type [{target}]")
 
     def get_tool_provided_job_metadata(self):
-        if self.tool_provided_job_metadata is not None:
-            return self.tool_provided_job_metadata
-
-        self.tool_provided_job_metadata = self.tool.tool_provided_metadata(self)
+        if self.tool_provided_job_metadata is None:
+            self.tool_provided_job_metadata = self.tool.tool_provided_metadata(self)
         return self.tool_provided_job_metadata
 
     def get_dataset_finish_context(self, job_context, output_dataset_assoc):
@@ -2264,6 +2262,8 @@ class MinimalJobWrapper(HasResourceParameters):
             return None
 
         exec_dir = kwds.get("exec_dir", os.path.abspath(os.getcwd()))
+        monitor_command = self.get_destination_configuration("container_monitor_command")
+        get_ip_method = self.get_destination_configuration("container_monitor_get_ip_method")
         work_dir = self.working_directory
         configs_dir = ensure_configs_directory(work_dir)
         container_config = os.path.join(configs_dir, "container_config.json")
@@ -2285,10 +2285,17 @@ class MinimalJobWrapper(HasResourceParameters):
             callback_url = endpoint_base % (galaxy_url, encoded_job_id, job_key)
             container_config_dict["callback_url"] = callback_url
 
+        if get_ip_method:
+            assert get_ip_method.startswith("command:"), f"Unsupported get_ip_method: {get_ip_method}"
+            container_config_dict["get_ip_method"] = get_ip_method
+
         with open(container_config, "w") as f:
             json.dump(container_config_dict, f)
 
-        return f"(python '{exec_dir}'/lib/galaxy_ext/container_monitor/monitor.py &); sleep 1 "
+        if not monitor_command:
+            _monitor_py = shlex.quote(os.path.join(exec_dir, "lib/galaxy_ext/container_monitor/monitor.py"))
+            monitor_command = f"python {_monitor_py}"
+        return f"({monitor_command} &); sleep 1 "
 
     @property
     def user(self):

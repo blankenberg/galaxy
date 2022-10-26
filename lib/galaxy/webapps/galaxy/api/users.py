@@ -7,6 +7,7 @@ import logging
 import re
 
 from fastapi import (
+    Path,
     Response,
     status,
 )
@@ -24,7 +25,6 @@ from galaxy import (
 )
 from galaxy.exceptions import ObjectInvalid
 from galaxy.managers import (
-    api_keys,
     base as managers_base,
     users,
 )
@@ -33,6 +33,8 @@ from galaxy.model import (
     User,
     UserAddress,
 )
+from galaxy.schema import APIKeyModel
+from galaxy.schema.fields import DecodedDatabaseIdField
 from galaxy.security.validate_user_input import (
     validate_email,
     validate_password,
@@ -55,17 +57,20 @@ from galaxy.webapps.base.controller import (
     UsesTagsMixin,
 )
 from galaxy.webapps.base.webapp import GalaxyWebTransaction
-from galaxy.webapps.galaxy.services.users import UsersService
-from . import (
+from galaxy.webapps.galaxy.api import (
     BaseGalaxyAPIController,
     depends,
     DependsOnTrans,
     Router,
 )
+from galaxy.webapps.galaxy.services.users import UsersService
 
 log = logging.getLogger(__name__)
 
 router = Router(tags=["users"])
+
+UserIdPathParam: DecodedDatabaseIdField = Path(..., title="User ID", description="The ID of the user to get.")
+APIKeyPathParam: str = Path(..., title="API Key", description="The API key of the user.")
 
 
 @router.cbv
@@ -84,12 +89,60 @@ class FastAPIHistories:
         self.service.recalculate_disk_usage(trans)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @router.get(
+        "/api/users/{user_id}/api_key",
+        name="get_or_create_api_key",
+        summary="Return the user's API key",
+    )
+    def get_or_create_api_key(
+        self, trans: ProvidesUserContext = DependsOnTrans, user_id: DecodedDatabaseIdField = UserIdPathParam
+    ) -> str:
+        return self.service.get_or_create_api_key(trans, user_id)
+
+    @router.get(
+        "/api/users/{user_id}/api_key/detailed",
+        name="get_api_key_detailed",
+        summary="Return the user's API key with extra information.",
+        responses={
+            200: {
+                "model": APIKeyModel,
+                "description": "The API key of the user.",
+            },
+            204: {
+                "description": "The user doesn't have an API key.",
+            },
+        },
+    )
+    def get_api_key(
+        self, trans: ProvidesUserContext = DependsOnTrans, user_id: DecodedDatabaseIdField = UserIdPathParam
+    ):
+        api_key = self.service.get_api_key(trans, user_id)
+        return api_key if api_key else Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @router.post("/api/users/{user_id}/api_key", summary="Creates a new API key for the user")
+    def create_api_key(
+        self, trans: ProvidesUserContext = DependsOnTrans, user_id: DecodedDatabaseIdField = UserIdPathParam
+    ) -> str:
+        return self.service.create_api_key(trans, user_id).key
+
+    @router.delete(
+        "/api/users/{user_id}/api_key",
+        summary="Delete the current API key of the user",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    def delete_api_key(
+        self,
+        trans: ProvidesUserContext = DependsOnTrans,
+        user_id: DecodedDatabaseIdField = UserIdPathParam,
+    ):
+        self.service.delete_api_key(trans, user_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 class UserAPIController(BaseGalaxyAPIController, UsesTagsMixin, BaseUIController, UsesFormDefinitionsMixin):
     user_manager: users.UserManager = depends(users.UserManager)
     user_serializer: users.UserSerializer = depends(users.UserSerializer)
     user_deserializer: users.UserDeserializer = depends(users.UserDeserializer)
-    api_key_manager: api_keys.ApiKeyManager = depends(api_keys.ApiKeyManager)
 
     @expose_api
     def index(self, trans: ProvidesUserContext, deleted="False", f_email=None, f_name=None, f_any=None, **kwd):
@@ -393,27 +446,34 @@ class UserAPIController(BaseGalaxyAPIController, UsesTagsMixin, BaseUIController
         email = user.email
         username = user.username
         inputs = list()
-        inputs.append(
-            {
-                "id": "email_input",
-                "name": "email",
-                "type": "text",
-                "label": "Email address",
-                "value": email,
-                "help": "If you change your email address you will receive an activation link in the new mailbox and you have to activate your account by visiting it.",
-            }
-        )
-        if trans.webapp.name == "galaxy":
+        user_info = {
+            "email": email,
+            "username": username,
+        }
+        is_galaxy_app = trans.webapp.name == "galaxy"
+        if trans.app.config.enable_account_interface or not is_galaxy_app:
             inputs.append(
                 {
-                    "id": "name_input",
-                    "name": "username",
+                    "id": "email_input",
+                    "name": "email",
                     "type": "text",
-                    "label": "Public name",
-                    "value": username,
-                    "help": 'Your public name is an identifier that will be used to generate addresses for information you share publicly. Public names must be at least three characters in length and contain only lower-case letters, numbers, and the "-" character.',
+                    "label": "Email address",
+                    "value": email,
+                    "help": "If you change your email address you will receive an activation link in the new mailbox and you have to activate your account by visiting it.",
                 }
             )
+        if is_galaxy_app:
+            if trans.app.config.enable_account_interface:
+                inputs.append(
+                    {
+                        "id": "name_input",
+                        "name": "username",
+                        "type": "text",
+                        "label": "Public name",
+                        "value": username,
+                        "help": 'Your public name is an identifier that will be used to generate addresses for information you share publicly. Public names must be at least three characters in length and contain only lower-case letters, numbers, and the "-" character.',
+                    }
+                )
             info_form_models = self.get_all_forms(
                 trans, filter=dict(deleted=False), form_type=trans.app.model.FormDefinition.types.USER_INFO
             )
@@ -441,25 +501,27 @@ class UserAPIController(BaseGalaxyAPIController, UsesTagsMixin, BaseUIController
                     info_field["cases"].append({"value": info_form["id"], "inputs": info_form["inputs"]})
                 inputs.append(info_field)
 
-            address_inputs = [{"type": "hidden", "name": "id", "hidden": True}]
-            for field in AddressField.fields():
-                address_inputs.append({"type": "text", "name": field[0], "label": field[1], "help": field[2]})
-            address_repeat = {
-                "title": "Address",
-                "name": "address",
-                "type": "repeat",
-                "inputs": address_inputs,
-                "cache": [],
-            }
-            address_values = [address.to_dict(trans) for address in user.addresses]
-            for address in address_values:
-                address_cache = []
-                for input in address_inputs:
-                    input_copy = input.copy()
-                    input_copy["value"] = address.get(input["name"])
-                    address_cache.append(input_copy)
-                address_repeat["cache"].append(address_cache)
-            inputs.append(address_repeat)
+            if trans.app.config.enable_account_interface:
+                address_inputs = [{"type": "hidden", "name": "id", "hidden": True}]
+                for field in AddressField.fields():
+                    address_inputs.append({"type": "text", "name": field[0], "label": field[1], "help": field[2]})
+                address_repeat = {
+                    "title": "Address",
+                    "name": "address",
+                    "type": "repeat",
+                    "inputs": address_inputs,
+                    "cache": [],
+                }
+                address_values = [address.to_dict(trans) for address in user.addresses]
+                for address in address_values:
+                    address_cache = []
+                    for input in address_inputs:
+                        input_copy = input.copy()
+                        input_copy["value"] = address.get(input["name"])
+                        address_cache.append(input_copy)
+                    address_repeat["cache"].append(address_cache)
+                inputs.append(address_repeat)
+                user_info["addresses"] = [address.to_dict(trans) for address in user.addresses]
 
             # Build input sections for extra user preferences
             extra_user_pref = self._build_extra_user_pref_inputs(trans, self._get_extra_user_preferences(trans), user)
@@ -488,12 +550,8 @@ class UserAPIController(BaseGalaxyAPIController, UsesTagsMixin, BaseUIController
                         help='Your public name provides a means of identifying you publicly within this tool shed. Public names must be at least three characters in length and contain only lower-case letters, numbers, and the "-" character. You cannot change your public name after you have created a repository in this tool shed.',
                     )
                 )
-        return {
-            "email": email,
-            "username": username,
-            "addresses": [address.to_dict(trans) for address in user.addresses],
-            "inputs": inputs,
-        }
+        user_info["inputs"] = inputs
+        return user_info
 
     @expose_api
     def set_information(self, trans, id, payload=None, **kwd):
@@ -851,59 +909,6 @@ class UserAPIController(BaseGalaxyAPIController, UsesTagsMixin, BaseUIController
             "toolbox_section_filters": {"title": "Sections", "config": trans.app.config.user_tool_section_filters},
             "toolbox_label_filters": {"title": "Labels", "config": trans.app.config.user_tool_label_filters},
         }
-
-    @expose_api
-    def api_key(self, trans, id, payload=None, **kwd):
-        """
-        Create API key.
-        """
-        payload = payload or {}
-        user = self._get_user(trans, id)
-        return self.api_key_manager.create_api_key(user)
-
-    @expose_api
-    def get_or_create_api_key(self, trans, id, payload=None, **kwd):
-        """
-        Unified 'get or create' for API key
-        """
-        payload = payload or {}
-        user = self._get_user(trans, id)
-        return self.api_key_manager.get_or_create_api_key(user)
-
-    @expose_api
-    def get_api_key(self, trans, id, payload=None, **kwd):
-        """
-        Get API key inputs.
-        """
-        payload = payload or {}
-        user = self._get_user(trans, id)
-        return self._build_inputs_api_key(user)
-
-    @expose_api
-    def set_api_key(self, trans, id, payload=None, **kwd):
-        """
-        Get API key inputs with new API key.
-        """
-        payload = payload or {}
-        user = self._get_user(trans, id)
-        self.api_key_manager.create_api_key(user)
-        return self._build_inputs_api_key(user, message="Generated a new web API key.")
-
-    def _build_inputs_api_key(self, user, message=""):
-        """
-        Build API key inputs.
-        """
-        inputs = [
-            {
-                "name": "api-key",
-                "type": "text",
-                "label": "Current API key:",
-                "value": user.api_keys[0].key if user.api_keys else "Not available.",
-                "readonly": True,
-                "help": " An API key will allow you to access via web API. Please note that this key acts as an alternate means to access your account and should be treated with the same care as your login password.",
-            }
-        ]
-        return {"message": message, "inputs": inputs}
 
     @expose_api
     def get_custom_builds(self, trans, id, payload=None, **kwd):

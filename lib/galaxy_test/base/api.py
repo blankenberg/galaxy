@@ -1,5 +1,6 @@
 import os
 from contextlib import contextmanager
+from typing import Optional
 from urllib.parse import (
     urlencode,
     urljoin,
@@ -8,6 +9,7 @@ from urllib.parse import (
 import pytest
 import requests
 
+from galaxy.util.properties import get_from_env
 from .api_asserts import (
     assert_error_code_is,
     assert_has_keys,
@@ -25,15 +27,8 @@ from .api_util import (
 from .interactor import TestCaseGalaxyInteractor as BaseInteractor
 
 CONFIG_PREFIXES = ["GALAXY_TEST_CONFIG_", "GALAXY_CONFIG_OVERRIDE_", "GALAXY_CONFIG_"]
-DEFAULT_CELERY_BROKER = "memory://"
-DEFAULT_CELERY_BACKEND = "rpc://localhost"
-for prefix in CONFIG_PREFIXES:
-    CELERY_BROKER = os.environ.get(f"{prefix}CELERY_BROKER", DEFAULT_CELERY_BROKER)
-    if CELERY_BROKER != DEFAULT_CELERY_BROKER:
-        break
-    CELERY_BACKEND = os.environ.get(f"{prefix}CELERY_BACKEND", DEFAULT_CELERY_BACKEND)
-    if CELERY_BACKEND != DEFAULT_CELERY_BACKEND:
-        break
+CELERY_BROKER = get_from_env("CELERY_BROKER", CONFIG_PREFIXES, "memory://")
+CELERY_BACKEND = get_from_env("CELERY_BACKEND", CONFIG_PREFIXES, "rpc://localhost")
 
 
 @pytest.fixture(scope="session")
@@ -46,8 +41,8 @@ class UsesCeleryTasks:
     def handle_galaxy_config_kwds(cls, config):
         config["enable_celery_tasks"] = True
         config["metadata_strategy"] = f'{config.get("metadata_strategy", "directory")}_celery'
-        config["celery_broker"] = CELERY_BROKER
-        config["celery_backend"] = CELERY_BACKEND
+        config.update({"celery_conf": {"broker_url": CELERY_BROKER}})
+        config.update({"celery_conf": {"result_backend": CELERY_BACKEND}})
 
     @pytest.fixture(autouse=True, scope="session")
     def _request_celery_app(self, celery_session_app, celery_config):
@@ -81,11 +76,12 @@ class UsesCeleryTasks:
 
 class UsesApiTestCaseMixin:
     url: str
+    _galaxy_interactor: Optional["ApiTestInteractor"] = None
 
     def tearDown(self):
         if os.environ.get("GALAXY_TEST_EXTERNAL") is None:
             # Only kill running jobs after test for managed test instances
-            for job in self.galaxy_interactor.get("jobs?state=running&?user_details=true").json():
+            for job in self.galaxy_interactor.get("jobs?state=running").json():
                 self._delete(f"jobs/{job['id']}")
 
     def _api_url(self, path, params=None, use_key=None, use_admin_key=None):
@@ -104,19 +100,21 @@ class UsesApiTestCaseMixin:
     def _setup_interactor(self):
         self.user_api_key = get_user_api_key()
         self.master_api_key = get_admin_api_key()
-        self.galaxy_interactor = self._get_interactor()
+        self._galaxy_interactor = self._get_interactor()
 
-    def _get_interactor(self, api_key=None):
+    @property
+    def galaxy_interactor(self) -> "ApiTestInteractor":
+        assert self._galaxy_interactor is not None
+        return self._galaxy_interactor
+
+    def _get_interactor(self, api_key=None) -> "ApiTestInteractor":
         return ApiTestInteractor(self, api_key=api_key)
 
-    def _setup_user(self, email, password=None, is_admin=True):
-        self.galaxy_interactor.ensure_user_with_email(email, password=password)
-        users = self._get("users", admin=is_admin).json()
-        user = [user for user in users if user["email"] == email][0]
-        return user
+    def _setup_user(self, email, password=None):
+        return self.galaxy_interactor.ensure_user_with_email(email, password=password)
 
-    def _setup_user_get_key(self, email, password=None, is_admin=True):
-        user = self._setup_user(email, password, is_admin)
+    def _setup_user_get_key(self, email, password=None):
+        user = self._setup_user(email, password)
         return user, self._post(f"users/{user['id']}/api_key", admin=True).json()
 
     @contextmanager

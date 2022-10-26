@@ -79,7 +79,6 @@ log = logging.getLogger("test_driver")
 
 # Global variables to pass database contexts around - only needed for older
 # Tool Shed twill tests that didn't utilize the API for such interactions.
-galaxy_context = None
 tool_shed_context = None
 install_context = None
 
@@ -511,6 +510,8 @@ def wait_for_http_server(host, port, prefix=None, sleep_amount=0.1, sleep_tries=
         prefix = f"{prefix}/"
     for _ in range(sleep_tries):
         # directly test the app, not the proxy
+        if port and isinstance(port, str):
+            port = int(port)
         conn = http.client.HTTPConnection(host, port)
         try:
             conn.request("GET", prefix)
@@ -526,7 +527,7 @@ def wait_for_http_server(host, port, prefix=None, sleep_amount=0.1, sleep_tries=
         raise Exception(message)
 
 
-def attempt_port(port):
+def attempt_port(port: int) -> Optional[int]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.bind(("", port))
@@ -536,9 +537,9 @@ def attempt_port(port):
         return None
 
 
-def attempt_ports(port=None, set_galaxy_web_port=True):
+def attempt_ports(port=None, set_galaxy_web_port=True) -> str:
     if port is not None:
-        if not attempt_port(port):
+        if not attempt_port(int(port)):
             raise Exception(f"An existing process seems bound to specified test server port [{port}]")
         return port
     else:
@@ -633,9 +634,7 @@ def build_galaxy_app(simple_kwargs) -> GalaxyUniverseApplication:
     app = GalaxyUniverseApplication(**simple_kwargs)
     log.info("Embedded Galaxy application started")
 
-    global galaxy_context
     global install_context
-    galaxy_context = app.model.context
     install_context = app.install_model.context
 
     # Toolbox indexing happens via the work queue out of band recently, and,
@@ -793,7 +792,7 @@ def launch_gravity(port, gxit_port=None, galaxy_config=None):
     if "interactivetools_proxy_host" not in galaxy_config:
         galaxy_config["interactivetools_proxy_host"] = f"localhost:{gxit_port}"
     # Can't use in-memory celery broker, just fall back to sqlalchemy
-    galaxy_config.pop("celery_broker", None)
+    galaxy_config.update({"celery_conf": {"broker_url": None}})
     config = {
         "gravity": {
             "gunicorn": {"bind": f"localhost:{port}", "preload": "false"},
@@ -864,7 +863,7 @@ def launch_server(app_factory, webapp_factory, prefix=DEFAULT_CONFIG_PREFIX, gal
 
     server, port, thread = uvicorn_serve(asgi_app, host=host, port=port)
     set_and_wait_for_http_target(prefix, host, port, url_prefix=url_prefix)
-    log.info(f"Embedded uvicorn web server for {name} started at {host}:{port}{url_prefix}")
+    log.debug(f"Embedded uvicorn web server for {name} started at {host}:{port}{url_prefix}")
     return EmbeddedServerWrapper(app, server, name, host, port, thread=thread, prefix=url_prefix)
 
 

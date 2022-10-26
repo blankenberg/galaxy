@@ -6,6 +6,7 @@ import shutil
 import tarfile
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum
 from json import (
     dump,
@@ -23,11 +24,17 @@ from typing import (
     Set,
     Tuple,
     Type,
+    TYPE_CHECKING,
     Union,
 )
 
 from bdbag import bdbag_api as bdb
 from boltons.iterutils import remap
+from rocrate.model.computationalworkflow import (
+    ComputationalWorkflow,
+    WorkflowDescription,
+)
+from rocrate.rocrate import ROCrate
 from sqlalchemy.orm import joinedload
 from sqlalchemy.sql import expression
 from typing_extensions import Protocol
@@ -48,6 +55,29 @@ from galaxy.model.orm.util import (
     get_object_session,
 )
 from galaxy.objectstore import ObjectStore
+from galaxy.schema.bco import (
+    BioComputeObjectCore,
+    DescriptionDomain,
+    DescriptionDomainUri,
+    ErrorDomain,
+    InputAndOutputDomain,
+    InputAndOutputDomainUri,
+    InputSubdomainItem,
+    OutputSubdomainItem,
+    ParametricDomain,
+    ParametricDomainItem,
+    PipelineStep,
+    ProvenanceDomain,
+    UsabilityDomain,
+    XrefItem,
+)
+from galaxy.schema.bco.io_domain import Uri
+from galaxy.schema.bco.util import (
+    extension_domains,
+    galaxy_execution_domain,
+    get_contributors,
+    write_to_file,
+)
 from galaxy.security.idencoding import IdEncodingHelper
 from galaxy.util import (
     FILENAME_VALID_CHARS,
@@ -57,12 +87,20 @@ from galaxy.util import (
 from galaxy.util.bunch import Bunch
 from galaxy.util.compression_utils import CompressedFile
 from galaxy.util.path import safe_walk
+from ._bco_convert_utils import (
+    bco_workflow_version,
+    SoftwarePrerequisteTracker,
+)
 from ..custom_types import json_encoder
 from ..item_attrs import (
     add_item_annotation,
     get_item_annotation_str,
 )
 from ... import model
+
+if TYPE_CHECKING:
+    from galaxy.managers.workflows import WorkflowContentsManager
+
 
 ObjectKeyType = Union[str, int]
 
@@ -98,6 +136,7 @@ class StoreAppProtocol(Protocol):
     security: IdEncodingHelper
     model: GalaxyModelMapping
     file_sources: ConfiguredFileSources
+    workflow_contents_manager: "WorkflowContentsManager"
 
 
 class ImportDiscardedDataType(Enum):
@@ -136,7 +175,7 @@ class ImportOptions:
 
 class SessionlessContext:
     def __init__(self):
-        self.objects = defaultdict(dict)
+        self.objects: Dict[Any, Any] = defaultdict(dict)
 
     def flush(self):
         pass
@@ -354,9 +393,9 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                 self.dataset_state_serialized = False
 
             if "id" in dataset_attrs and self.import_options.allow_edit and not self.sessionless:
-                dataset_instance = self.sa_session.query(getattr(model, dataset_attrs["model_class"])).get(
-                    dataset_attrs["id"]
-                )
+                dataset_instance: model.DatasetInstance = self.sa_session.query(
+                    getattr(model, dataset_attrs["model_class"])
+                ).get(dataset_attrs["id"])
                 attributes = [
                     "name",
                     "extension",
@@ -387,7 +426,6 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                     metadata = {"dbkey": "?"}
 
                 model_class = dataset_attrs.get("model_class", "HistoryDatasetAssociation")
-                dataset_instance: model.DatasetInstance
                 if model_class == "HistoryDatasetAssociation":
                     # Create dataset and HDA.
                     dataset_instance = model.HistoryDatasetAssociation(
@@ -634,9 +672,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                 and not self.sessionless
                 and self.import_options.allow_edit
             ):
-                library_folder = self.sa_session.query(model.LibraryFolder).get(
-                    self.app.security.decode_id(library_attrs["id"])
-                )
+                library_folder = self.sa_session.query(model.LibraryFolder).get(library_attrs["id"])
                 import_folder(library_attrs, root_folder=library_folder)
             else:
                 assert self.import_options.allow_library_creation
@@ -2113,6 +2149,359 @@ class DirectoryModelExportStore(ModelExportStore):
         return isinstance(exc_val, TypeError)
 
 
+class WriteCrates:
+    def _generate_markdown_readme(self):
+        markdown_parts: List[str] = []
+        if self._is_single_invocation_export():
+            invocation = self.included_invocations[0]
+            name = invocation.workflow.name
+            create_time = invocation.create_time
+            markdown_parts.append("# Galaxy Workflow Invocation Export")
+            markdown_parts.append("")
+            markdown_parts.append(f"This crate describes the invocation of workflow {name} executed at {create_time}.")
+        else:
+            markdown_parts.append("# Galaxy Dataset Export")
+
+        return "\n".join(markdown_parts)
+
+    def _is_single_invocation_export(self):
+        return len(self.included_invocations) == 1
+
+    def _init_crate(self):
+        ro_crate = ROCrate()
+
+        markdown_path = os.path.join(self.export_directory, "README.md")
+        with open(markdown_path, "w") as f:
+            f.write(self._generate_markdown_readme())
+
+        properties = {
+            "name": "README.md",
+            "encodingFormat": "text/markdown",
+            "about": {"@id": "./"},
+        }
+        ro_crate.add_file(
+            markdown_path,
+            dest_path="README.md",
+            properties=properties,
+        )
+
+        for dataset, _ in self.included_datasets.values():
+            if dataset.dataset.id in self.dataset_id_to_path:
+                file_name, _ = self.dataset_id_to_path[dataset.dataset.id]
+                name = dataset.name
+                encoding_format = dataset.datatype.get_mime()
+                properties = {
+                    "name": name,
+                    "encodingFormat": encoding_format,
+                }
+                ro_crate.add_file(
+                    file_name,
+                    dest_path=file_name,
+                    properties=properties,
+                )
+
+        workflows_directory = self.workflows_directory
+        if os.path.exists(workflows_directory):
+            for filename in os.listdir(workflows_directory):
+                workflow_cls = ComputationalWorkflow if not filename.endswith(".cwl") else WorkflowDescription
+                lang = "galaxy" if not filename.endswith(".cwl") else "cwl"
+                dest_path = os.path.join("workflows", filename)
+                ro_crate.add_workflow(
+                    source=os.path.join(workflows_directory, filename),
+                    dest_path=dest_path,
+                    main=False,
+                    cls=workflow_cls,
+                    lang=lang,
+                )
+
+        found_workflow_licenses = set()
+        for workflow_invocation in self.included_invocations:
+            workflow = workflow_invocation.workflow
+            license = workflow.license
+            if license:
+                found_workflow_licenses.add(license)
+        if len(found_workflow_licenses) == 1:
+            ro_crate.license = next(iter(found_workflow_licenses))
+
+        # TODO: license per workflow
+        # TODO: API options to license workflow outputs seprately
+        # TODO: Export report as PDF and stick it in here
+        return ro_crate
+
+
+class WorkflowInvocationOnlyExportStore(DirectoryModelExportStore):
+    def export_history(self, history: model.History, include_hidden: bool = False, include_deleted: bool = False):
+        """Export history to store."""
+        raise NotImplementedError()
+
+    def export_library(self, history, include_hidden=False, include_deleted=False):
+        """Export library to store."""
+        raise NotImplementedError()
+
+    @property
+    def only_invocation(self) -> model.WorkflowInvocation:
+        assert len(self.included_invocations) == 1
+        return self.included_invocations[0]
+
+
+@dataclass
+class BcoExportOptions:
+    galaxy_url: str
+    galaxy_version: str
+    merge_history_metadata: bool = False
+    override_environment_variables: Optional[Dict[str, str]] = None
+    override_empirical_error: Optional[Dict[str, str]] = None
+    override_algorithmic_error: Optional[Dict[str, str]] = None
+    override_xref: Optional[List[XrefItem]] = None
+
+
+class BcoModelExportStore(WorkflowInvocationOnlyExportStore):
+    def __init__(self, uri, export_options: BcoExportOptions, **kwds):
+        temp_output_dir = tempfile.mkdtemp()
+        self.temp_output_dir = temp_output_dir
+        if "://" in str(uri):
+            self.out_file = os.path.join(temp_output_dir, "out")
+            self.file_source_uri = uri
+            export_directory = os.path.join(temp_output_dir, "export")
+        else:
+            self.out_file = uri
+            self.file_source_uri = None
+            export_directory = temp_output_dir
+        self.export_options = export_options
+        super().__init__(export_directory, **kwds)
+
+    def _finalize(self):
+        super()._finalize()
+        core_biocompute_object, object_id = self._core_biocompute_object_and_object_id()
+        write_to_file(object_id, core_biocompute_object, self.out_file)
+        if self.file_source_uri:
+            file_source_path = self.file_sources.get_file_source_path(self.file_source_uri)
+            file_source = file_source_path.file_source
+            assert os.path.exists(self.out_file)
+            file_source.write_from(file_source_path.path, self.out_file)
+
+    def _core_biocompute_object_and_object_id(self) -> Tuple[BioComputeObjectCore, str]:
+        assert self.app  # need app.security to do anything...
+        export_options = self.export_options
+        workflow_invocation = self.only_invocation
+        history = workflow_invocation.history
+        workflow = workflow_invocation.workflow
+        stored_workflow = workflow.stored_workflow
+
+        def get_dataset_url(encoded_dataset_id: str):
+            return f"{export_options.galaxy_url}api/datasets/{encoded_dataset_id}/display"
+
+        # pull in the creator_metadata info from workflow if it exists
+        contributors = get_contributors(workflow.creator_metadata)
+        provenance_domain = ProvenanceDomain(
+            name=workflow.name,
+            version=bco_workflow_version(workflow),
+            review=[],
+            contributors=contributors,
+            license=workflow.license or "",
+            created=workflow_invocation.create_time.isoformat(),
+            modified=workflow_invocation.update_time.isoformat(),
+        )
+
+        keywords = []
+        for tag in stored_workflow.tags:
+            keywords.append(tag.user_tname)
+        if export_options.merge_history_metadata:
+            for tag in history.tags:
+                if tag.user_tname not in keywords:
+                    keywords.append(tag.user_tname)
+
+        # metrics = {}  ... TODO
+        pipeline_steps: List[PipelineStep] = []
+        software_prerequisite_tracker = SoftwarePrerequisteTracker()
+        input_subdomain_items: List[InputSubdomainItem] = []
+        output_subdomain_items: List[OutputSubdomainItem] = []
+        for step in workflow_invocation.steps:
+            workflow_step = step.workflow_step
+            software_prerequisite_tracker.register_step(workflow_step)
+            if workflow_step.type == "tool":
+                workflow_outputs_list = set()
+                output_list: List[DescriptionDomainUri] = []
+                input_list: List[DescriptionDomainUri] = []
+                for wo in workflow_step.workflow_outputs:
+                    workflow_outputs_list.add(wo.output_name)
+                for job in step.jobs:
+                    for job_input in job.input_datasets:
+                        if hasattr(job_input.dataset, "dataset_id"):
+                            encoded_dataset_id = self.app.security.encode_id(job_input.dataset.dataset_id)
+                            url = get_dataset_url(encoded_dataset_id)
+                            input_uri_obj = DescriptionDomainUri(
+                                # TODO: that should maybe be a step prefix + element identifier where appropriate.
+                                filename=job_input.dataset.name,
+                                uri=url,
+                                access_time=job_input.dataset.create_time.isoformat(),
+                            )
+                            input_list.append(input_uri_obj)
+
+                    for job_output in job.output_datasets:
+                        if hasattr(job_output.dataset, "dataset_id"):
+                            encoded_dataset_id = self.app.security.encode_id(job_output.dataset.dataset_id)
+                            url = get_dataset_url(encoded_dataset_id)
+                            output_obj = DescriptionDomainUri(
+                                filename=job_output.dataset.name,
+                                uri=url,
+                                access_time=job_output.dataset.create_time.isoformat(),
+                            )
+                            output_list.append(output_obj)
+
+                            if job_output.name in workflow_outputs_list:
+                                output = OutputSubdomainItem(
+                                    mediatype=job_output.dataset.extension,
+                                    uri=InputAndOutputDomainUri(
+                                        filename=job_output.dataset.name,
+                                        uri=url,
+                                        access_time=job_output.dataset.create_time.isoformat(),
+                                    ),
+                                )
+                                output_subdomain_items.append(output)
+                step_index = workflow_step.order_index
+                step_name = workflow_step.label or workflow_step.tool_id
+                pipeline_step = PipelineStep(
+                    step_number=step_index,
+                    name=step_name,
+                    description=workflow_step.annotations[0].annotation if workflow_step.annotations else "",
+                    version=workflow_step.tool_version,
+                    prerequisite=[],
+                    input_list=input_list,
+                    output_list=output_list,
+                )
+                pipeline_steps.append(pipeline_step)
+
+            if workflow_step.type == "data_input" and step.output_datasets:
+                for output_assoc in step.output_datasets:
+                    encoded_dataset_id = self.app.security.encode_id(output_assoc.dataset_id)
+                    url = get_dataset_url(encoded_dataset_id)
+                    input_obj = InputSubdomainItem(
+                        uri=Uri(
+                            uri=url,
+                            filename=workflow_step.label,
+                            access_time=workflow_step.update_time.isoformat(),
+                        ),
+                    )
+                    input_subdomain_items.append(input_obj)
+
+            if workflow_step.type == "data_collection_input" and step.output_dataset_collections:
+                for output_dataset_collection_association in step.output_dataset_collections:
+                    encoded_dataset_id = self.app.security.encode_id(
+                        output_dataset_collection_association.dataset_collection_id
+                    )
+                    url = f"{export_options.galaxy_url}api/dataset_collections/{encoded_dataset_id}/download"
+                    input_obj = InputSubdomainItem(
+                        uri=Uri(
+                            uri=url,
+                            filename=workflow_step.label,
+                            access_time=workflow_step.update_time.isoformat(),
+                        ),
+                    )
+                    input_subdomain_items.append(input_obj)
+
+        usability_domain_str: List[str] = []
+        for a in stored_workflow.annotations:
+            usability_domain_str.append(a.annotation)
+        if export_options.merge_history_metadata:
+            for h in history.annotations:
+                usability_domain_str.append(h.annotation)
+
+        parametric_domain_items: List[ParametricDomainItem] = []
+        for inv_step in workflow_invocation.steps:
+            try:
+                for k, v in inv_step.workflow_step.tool_inputs.items():
+                    param, value, step = k, v, inv_step.workflow_step.order_index
+                    parametric_domain_items.append(
+                        ParametricDomainItem(param=str(param), value=str(value), step=str(step))
+                    )
+            except Exception:
+                continue
+
+        encoded_workflow_id = self.app.security.encode_id(workflow.id)
+        execution_domain = galaxy_execution_domain(
+            export_options.galaxy_url,
+            f"{export_options.galaxy_url}api/workflows?encoded_workflow_id={encoded_workflow_id}",
+            software_prerequisite_tracker.software_prerequisites,
+            export_options.override_environment_variables,
+        )
+        extension_domain = extension_domains(export_options.galaxy_url, export_options.galaxy_version)
+        error_domain = ErrorDomain(
+            empirical_error=export_options.override_empirical_error or {},
+            algorithmic_error=export_options.override_algorithmic_error or {},
+        )
+        usability_domain = UsabilityDomain(__root__=usability_domain_str)
+        description_domain = DescriptionDomain(
+            keywords=keywords,
+            xref=export_options.override_xref or [],
+            platform=["Galaxy"],
+            pipeline_steps=pipeline_steps,
+        )
+        parametric_domain = ParametricDomain(__root__=parametric_domain_items)
+        io_domain = InputAndOutputDomain(
+            input_subdomain=input_subdomain_items,
+            output_subdomain=output_subdomain_items,
+        )
+        core = BioComputeObjectCore(
+            description_domain=description_domain,
+            error_domain=error_domain,
+            execution_domain=execution_domain,
+            extension_domain=extension_domain,
+            io_domain=io_domain,
+            parametric_domain=parametric_domain,
+            provenance_domain=provenance_domain,
+            usability_domain=usability_domain,
+        )
+        encoded_invocation_id = self.app.security.encode_id(workflow_invocation.id)
+        url = f"{export_options.galaxy_url}api/invocations/{encoded_invocation_id}"
+        return core, url
+
+
+class ROCrateModelExportStore(DirectoryModelExportStore, WriteCrates):
+    def __init__(self, crate_directory, **kwds):
+        self.crate_directory = crate_directory
+        super().__init__(crate_directory, export_files="symlink", **kwds)
+
+    def _finalize(self):
+        super()._finalize()
+        ro_crate = self._init_crate()
+        ro_crate.write(self.crate_directory)
+
+
+class ROCrateArchiveModelExportStore(DirectoryModelExportStore, WriteCrates):
+    def __init__(self, uri, **kwds):
+        temp_output_dir = tempfile.mkdtemp()
+        self.temp_output_dir = temp_output_dir
+        if "://" in str(uri):
+            self.out_file = os.path.join(temp_output_dir, "out")
+            self.file_source_uri = uri
+            export_directory = os.path.join(temp_output_dir, "export")
+        else:
+            self.out_file = uri
+            self.file_source_uri = None
+            export_directory = temp_output_dir
+        super().__init__(export_directory, **kwds)
+
+    def _finalize(self):
+        super()._finalize()
+        ro_crate = self._init_crate()
+        ro_crate.write(self.export_directory)
+        out_file_name = str(self.out_file)
+        if out_file_name.endswith(".zip"):
+            out_file = out_file_name[: -len(".zip")]
+        else:
+            out_file = out_file_name
+        rval = shutil.make_archive(out_file, "zip", self.export_directory)
+        if not self.file_source_uri:
+            shutil.move(rval, self.out_file)
+        else:
+            file_source_path = self.file_sources.get_file_source_path(self.file_source_uri)
+            file_source = file_source_path.file_source
+            assert os.path.exists(rval), rval
+            file_source.write_from(file_source_path.path, rval)
+        shutil.rmtree(self.temp_output_dir)
+
+
 class TarModelExportStore(DirectoryModelExportStore):
     def __init__(self, uri, gzip=True, **kwds):
         self.gzip = gzip
@@ -2178,8 +2567,15 @@ class BagArchiveModelExportStore(BagDirectoryModelExportStore):
         shutil.rmtree(self.temp_output_dir)
 
 
-def get_export_store_factory(app, download_format: str, export_files=None) -> Callable[[str], ModelExportStore]:
-    export_store_class: Union[Type[TarModelExportStore], Type[BagArchiveModelExportStore]]
+def get_export_store_factory(
+    app, download_format: str, export_files=None, bco_export_options: Optional[BcoExportOptions] = None
+) -> Callable[[str], ModelExportStore]:
+    export_store_class: Union[
+        Type[TarModelExportStore],
+        Type[BagArchiveModelExportStore],
+        Type[ROCrateArchiveModelExportStore],
+        Type[BcoModelExportStore],
+    ]
     export_store_class_kwds = {
         "app": app,
         "export_files": export_files,
@@ -2191,6 +2587,11 @@ def get_export_store_factory(app, download_format: str, export_files=None) -> Ca
     elif download_format in ["tar"]:
         export_store_class = TarModelExportStore
         export_store_class_kwds["gzip"] = False
+    elif download_format == "rocrate.zip":
+        export_store_class = ROCrateArchiveModelExportStore
+    elif download_format == "bco.json":
+        export_store_class = BcoModelExportStore
+        export_store_class_kwds["export_options"] = bco_export_options
     elif download_format.startswith("bag."):
         bag_archiver = download_format[len("bag.") :]
         if bag_archiver not in ["zip", "tar", "tgz"]:

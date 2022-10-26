@@ -28,8 +28,8 @@
                 </div>
                 <FormCard
                     v-for="(cache, cacheId) in input.cache"
-                    data-description="repeat block"
                     :key="cacheId"
+                    data-description="repeat block"
                     :title="repeatTitle(cacheId, input.title)">
                     <template v-slot:operations>
                         <b-button
@@ -75,6 +75,7 @@
                 :collapsed-enable-icon="collapsedEnableIcon"
                 :collapsed-disable-text="collapsedDisableText"
                 :collapsed-disable-icon="collapsedDisableIcon"
+                :workflow-building-mode="workflowBuildingMode"
                 @change="onChange" />
         </div>
     </div>
@@ -137,6 +138,10 @@ export default {
         onChangeForm: {
             type: Function,
             required: true,
+        },
+        workflowBuildingMode: {
+            type: Boolean,
+            default: false,
         },
     },
     methods: {

@@ -1,7 +1,7 @@
 <template>
     <div
         :id="contentId"
-        :class="['content-item m-1 p-0 rounded content-buttons', contentCls]"
+        :class="['content-item m-1 p-0 rounded btn-transparent-background', contentCls]"
         :data-hid="id"
         :data-state="state">
         <div class="p-1 cursor-pointer" draggable @dragstart="onDragStart" @click.stop="onClick">
@@ -52,11 +52,13 @@
                 </span>
                 <ContentOptions
                     v-else
+                    :writable="writable"
                     :is-dataset="isDataset"
                     :is-deleted="item.deleted"
                     :is-history-item="isHistoryItem"
                     :is-visible="item.visible"
                     :state="state"
+                    :item-urls="itemUrls"
                     @delete="$emit('delete')"
                     @display="onDisplay"
                     @edit="onEdit"
@@ -84,7 +86,9 @@
             <DatasetDetails
                 v-if="expandDataset"
                 :dataset="item"
+                :writable="writable"
                 :show-highlight="isHistoryItem"
+                :item-urls="itemUrls"
                 @edit="onEdit"
                 @toggleHighlights="toggleHighlights" />
         </b-collapse>
@@ -92,7 +96,6 @@
 </template>
 
 <script>
-import { iframeAdd } from "components/plugins/legacyNavigation";
 import { StatelessTags } from "components/Tags";
 import { STATES, HIERARCHICAL_COLLECTION_JOB_STATES } from "./model/states";
 import CollectionDescription from "./Collection/CollectionDescription";
@@ -115,6 +118,7 @@ export default {
         FontAwesomeIcon,
     },
     props: {
+        writable: { type: Boolean, default: true },
         expandDataset: { type: Boolean, required: true },
         highlight: { type: String, default: null },
         id: { type: Number, required: true },
@@ -158,16 +162,36 @@ export default {
                         return state;
                     }
                 }
-                return "ok";
-            } else {
+            } else if (this.item.state) {
                 return this.item.state;
             }
+            return "ok";
         },
         tags() {
             return this.item.tags;
         },
         tagsDisabled() {
-            return !this.expandDataset || !this.isHistoryItem;
+            return !this.writable || !this.expandDataset || !this.isHistoryItem;
+        },
+        isCollection() {
+            return "collection_type" in this.item;
+        },
+        /** Relative URLs for history item actions */
+        itemUrls() {
+            const id = this.item.id;
+            if (this.isCollection) {
+                return {
+                    edit: `/collection/${id}/edit`,
+                };
+            }
+            return {
+                display: `/datasets/${id}/preview`,
+                edit: `/datasets/${id}/edit`,
+                showDetails: `/datasets/${id}/details`,
+                reportError: `/datasets/${id}/error`,
+                rerun: `/tool_runner/rerun?id=${id}`,
+                visualize: `/visualizations?dataset_id=${id}`,
+            };
         },
     },
     methods: {
@@ -179,8 +203,7 @@ export default {
             }
         },
         onDisplay() {
-            const url = `datasets/${this.item.id}/display/?preview=True`;
-            iframeAdd({ path: url, title: this.name });
+            this.$router.push(this.itemUrls.display, { title: this.name });
         },
         onDragStart(evt) {
             evt.dataTransfer.dropEffect = "move";
@@ -188,11 +211,7 @@ export default {
             evt.dataTransfer.setData("text", JSON.stringify([this.item]));
         },
         onEdit() {
-            if (this.item.collection_type) {
-                this.$router.push(`/collection/edit/${this.item.id}`);
-            } else {
-                this.$router.push(`/datasets/edit/${this.item.id}`);
-            }
+            this.$router.push(this.itemUrls.edit);
         },
         onTags(newTags) {
             this.$emit("tag-change", this.item, newTags);
@@ -207,7 +226,7 @@ export default {
     },
 };
 </script>
-<style>
+<style lang="scss">
 .content-item:hover {
     filter: brightness(105%);
 }
